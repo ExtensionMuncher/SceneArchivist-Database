@@ -1,8 +1,9 @@
 import { matchingCharacter, nameKey } from './diary-cast.js';
+export const AUTHOR_IDENTITY_LIMIT = 4000;
 const clean=(v,n)=>typeof v==='string'?v.trim().slice(0,n):'';
 export function storyContext(state,archive){
     const found=(Array.isArray(state?.storyContexts)?state.storyContexts:[]).find(x=>x?.archive===archive);
-    return {archive,setting:clean(found?.setting,4000),authors:(Array.isArray(found?.authors)?found.authors:[]).filter(x=>x&&typeof x.name==='string').map(x=>({name:clean(x.name,120),text:clean(x.text,1500)})).filter(x=>x.name&&x.text)};
+    return {archive,setting:clean(found?.setting,4000),authors:(Array.isArray(found?.authors)?found.authors:[]).filter(x=>x&&typeof x.name==='string').map(x=>({name:clean(x.name,120),text:clean(x.text,AUTHOR_IDENTITY_LIMIT)})).filter(x=>x.name&&x.text)};
 }
 export function saveStoryContext(state,context){state.storyContexts=[...(Array.isArray(state.storyContexts)?state.storyContexts:[]).filter(x=>x?.archive!==context.archive),storyContext({storyContexts:[context]},context.archive)];}
 export function authorName(roster,name){return matchingCharacter(roster,name)?.name||name;}

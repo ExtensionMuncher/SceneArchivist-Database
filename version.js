@@ -1,1 +1,1 @@
-export const VERSION = '2.2.0-db.41';
+export const VERSION = '2.2.1-beta.1';

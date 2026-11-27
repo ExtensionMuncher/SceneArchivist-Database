@@ -1,4 +1,5 @@
 import * as M from './memory-engine.js';
+import { AUTHOR_IDENTITY_LIMIT } from './story-context.js';
 import { escape as html } from './workflow-tools.js';
 import { mountTools } from './workbench-tools.js';
 import { mountRecovery } from './workbench-recovery.js';
@@ -143,7 +144,7 @@ export function mountWorkbench(w, root) {
         </details>
         <details class="sa-inline-tools"><summary>Diary author identity</summary>
             <p class="sa-hint">Scans propose missing identities and voice directions during structured extraction, with no extra model request. Saved author edits take priority. Clear and save to return to scan-generated guidance when available. Matching cards provide background only, never event knowledge. Story setting is in Settings.</p>
-            <label class="sa-field"><span>Identity and voice</span><textarea class="text_pole" data-sa-field="diaryAuthorIdentity" rows="3" maxlength="1500"></textarea></label>
+            <label class="sa-field"><span>Identity and voice (up to ${AUTHOR_IDENTITY_LIMIT.toLocaleString('en-US')} characters)</span><textarea class="text_pole" data-sa-field="diaryAuthorIdentity" rows="3" maxlength="${AUTHOR_IDENTITY_LIMIT}"></textarea></label>
             <div class="sa-row">${button('saveDiaryIdentity','Save author identity')}</div>
         </details>
         <details class="sa-inline-tools"><summary>Diary blacklist</summary>

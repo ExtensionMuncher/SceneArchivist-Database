@@ -165,3 +165,7 @@ Bulk review now distinguishes saving, deferring (unchecked), and permanently dis
 - Ensemble retrieval requires uniquely resolved owners for personal knowledge and Little Things. Source opening uses the same eligible record set as search/tree navigation.
 - No migration or reindexing required. This is a release candidate; full host/browser/provider tests remain necessary.
 - Bulk job completion preserves live diary blacklist and roster edits made during a pause.
+
+
+### 2.2.1-beta.1 — Longer manual diary author identities
+- Raised the manual identity and voice limit from 1,500 to 4,000 characters in the editor, save validation, and persistence/restore normalization. Automatic profile extraction limits are unchanged. No database migration or reindexing required.

@@ -6,6 +6,6 @@
     "js": "bootstrap.js",
     "css": "style.css",
     "author": "Mira (database-mode refactor)",
-    "version": "2.2.0-db.41",
+    "version": "2.2.1-beta.1",
     "homePage": "https://github.com/AmiBastian/SillyTavern-SceneArchivist"
 }

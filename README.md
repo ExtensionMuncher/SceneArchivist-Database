@@ -4,7 +4,7 @@
 
 Archive your roleplay as it unfolds, build a searchable record of its history, and let your model look up old events when they actually matter — without stuffing the entire archive into every reply.
 
-> **Public beta · 2.2.0-db.41**  
+> **Public beta · 2.2.1-beta.1**  
 > This is a substantially reworked fork of [Scene Archivist by AmiBastian](https://github.com/AmiBastian/SillyTavern-SceneArchivist). The Database Edition changes the storage, retrieval, and overall purpose of the original extension. It is intended for long-running roleplays and continuity-heavy stories. Back up your chats and databases before installing or updating.
 
 ## What makes this edition different?
@@ -198,7 +198,7 @@ The active persona is excluded from diary generation by default. Use **Diary bla
 
 **Diary author identity** stores per-author interpretive guidance: pronouns, role, established personality, vocabulary, emotional register and writing style. Scans can propose missing identities and voice guidance within the existing structured-extraction response, without a separate model call. Generated guidance must be supported by accepted current evidence. It may be absent for sparse or poorly documented characters.
 
-Saved manual identities take priority; edit and save to override an automatic profile, or clear and save to return to available scan-generated guidance. The separate optional voice/style field is guidance for a generation request, not a persistent per-author profile. Use the identity field for permanent voice instructions. Matching character cards and story setting provide background, not personal event knowledge.
+Manual author identities support up to 4,000 characters, including persistent voice guidance. Automatic profile extraction remains unchanged. Saved manual identities take priority; edit and save to override an automatic profile, or clear and save to return to available scan-generated guidance. The separate optional voice/style field is guidance for a generation request, not a persistent per-author profile. Use the identity field for permanent voice instructions. Matching character cards and story setting provide background, not personal event knowledge.
 
 Diaries are creative, first-person interpretations of selected evidence. They are **not authoritative facts**, are not automatically generated during scans, and are excluded from main-model archive retrieval and ambient RP injection. A model can still write an inaccurate or out-of-character diary; review it.
 
@@ -256,4 +256,4 @@ The db.41 corrective release candidate passed 20 targeted module/regression chec
 
 Based on [AmiBastian/SillyTavern-SceneArchivist](https://github.com/AmiBastian/SillyTavern-SceneArchivist), upstream version **2.1.11**, commit [`af90a56dd46bfa995fd996f8c77548f1d40710f5`](https://github.com/AmiBastian/SillyTavern-SceneArchivist/commit/af90a56dd46bfa995fd996f8c77548f1d40710f5). The manifest credits Mira for the database-mode refactor.
 
-`DATABASE_MODE_SOURCE.txt` records the original source revision. `DATABASE_MODE_README.md` is retained as historical development and migration notes; some earlier entries describe superseded UI or behavior. This README describes the current db.41 edition.
+`DATABASE_MODE_SOURCE.txt` records the original source revision. `DATABASE_MODE_README.md` is retained as historical development and migration notes; some earlier entries describe superseded UI or behavior. This README describes the current 2.2.1-beta.1 edition.

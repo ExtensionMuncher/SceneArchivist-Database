@@ -476,7 +476,7 @@ export class Workbench {
         const context=this.storyContext(), origin=this.identity(), name=(this.value('diaryName').trim()||this.value('diaryCharacter').trim());
         if(!context.archive)throw new Error('Choose a story database first.');
         const value=this.value(author?'diaryAuthorIdentity':'storySettingContext').trim();
-        if(value.length>(author?1500:4000))throw new Error('Context exceeds its character limit.');
+        if(value.length>(author?StoryContext.AUTHOR_IDENTITY_LIMIT:4000))throw new Error('Context exceeds its character limit.');
         if(author&&!Cast.usableName(name))throw new Error('Choose an individual diary author first.');
         return this.withLock(async()=>{
             if(this.identity()!==origin||this.h.settings().lorebook!==context.archive)throw new Error('Story changed. Reopen the context controls.');
