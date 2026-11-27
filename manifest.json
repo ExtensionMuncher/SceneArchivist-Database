@@ -1,11 +1,11 @@
 {
-    "display_name": "Scene Archivist",
+    "display_name": "Scene Archivist \u2014 Database",
     "loading_order": 100,
     "requires": [],
     "optional": [],
-    "js": "index.js",
+    "js": "bootstrap.js",
     "css": "style.css",
-    "author": "Mira",
-    "version": "2.1.11",
+    "author": "Mira (database-mode refactor)",
+    "version": "2.2.0-db.41",
     "homePage": "https://github.com/AmiBastian/SillyTavern-SceneArchivist"
 }

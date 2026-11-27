@@ -4,9 +4,22 @@ const info = (title, description, changes, ai = 'no', example = '', tab = '') =>
 
 /** The same explanations power hover, keyboard help, touch help and the guide. */
 export const ACTION_HELP = {
+    storyThorough: info('Scan all new messages', 'Scan every story message that Scene Archivist has not already processed. Large chats are split into bounded passes automatically.', 'Creates reviewable source-backed evidence and structured continuity records. It does not alter chat messages or inject records into normal RP prompts.', 'yes', 'Use this for ordinary catch-up after roleplaying.', 'story'),
+    storyRange: info('Choose a message range', 'Open the exact-range scanner for one specific part of the chat.', 'Changes only which Scene Archivist section is visible until you actually scan the selected range.', 'no', 'Use this for one old scene, a corrected section, or a small test sample.', 'archive'),
+    estimateThorough: info('Estimate new-message scan', 'Show how much unscanned story material is waiting and how it will be split before any scan begins.', 'Makes no model request and writes no evidence.', 'no', '', 'story'),
+    setupHealth: info('Check database', 'Check whether the selected database, source links, and helper configuration are usable.', 'Reports problems only. It does not scan messages or rewrite records.', 'no', '', 'settings'),
+    safeDiagnostics: info('Export diagnostics', 'Create a troubleshooting report for Scene Archivist without exporting your whole story.', 'Creates a diagnostic report. It does not change database records.', 'no', '', 'settings'),
+    groundingCheck: info('Test evidence grounding', 'Run a small helper-model test to check whether retrieved evidence is followed faithfully.', 'May use model requests but does not rewrite story evidence.', 'yes', '', 'settings'),
+    repairMissing: info('Repair missing information', 'Find saved records with missing recoverable dates and archive units that never received character-memory processing.', 'Fills dates only from verified source chronology, then prepares source-backed character memories for review. It never invents unknown dates.', 'maybe', 'Use after an older batch scan finished without dates or character-library entries.', 'maintain'),
+    clearDatabase: info('Clear Scene Archivist data', 'Remove Scene Archivist records and scan coverage for this story while leaving the SillyTavern chat itself untouched.', 'Deletes this story’s Scene Archivist database records after confirmation. Export a backup first if you may want them back.', 'no', '', 'maintain'),
+    debugToggle: info('Toggle debug console', 'Choose whether Scene Archivist copies its structured diagnostic events into the browser console.', 'Does not affect scanning or saved story data. Console logging is off by default; the in-extension recent log still works.', 'no', '', 'settings'),
+    debugView: info('View debug log', 'Open the recent Scene Archivist diagnostic events kept for this page session.', 'Read-only. Failures include the stage, message range, selected profile/model when available, and the actual error.', 'no', '', 'settings'),
+    debugClear: info('Clear debug log', 'Erase the in-memory Scene Archivist diagnostic events for this page session.', 'Does not touch story data or browser console history.', 'no', '', 'settings'),
     firstArchive: info('Start here', 'Choose a connection, archive and exact chat range with a guided setup.', 'Setup can create and attach a lorebook. It previews the range before you start a model request.', 'no', 'Try one short scene first, then review its summary.', 'archive'),
-    rangePreview: info('Preview selected messages', 'Check the first and last message numbers and how much text is in that inclusive range.', 'Displays a preview. It does not summarize, hide messages or change your books.', 'no', '12 to 25 includes both message 12 and message 25.', 'archive'),
-    rangeArchive: info('Summarize this range', 'Send exactly the selected messages to your archive model.', 'Prepares dated archive entries using your review settings. The hide option applies only after a successful summary.', 'yes', '12 to 25 creates a summary from those messages, leaving 26 onward for later.', 'archive'),
+    rangePreview: info('Preview selected messages', 'Show exactly which messages are inside your chosen Start and End numbers. Both endpoints are included.', 'Previewing changes nothing and makes no model request.', 'no', '12 to 25 includes both message 12 and message 25.', 'archive'),
+    rangeArchive: info('Scan selected range', 'Scan only the messages between your selected Start and End points instead of all pending material.', 'Creates reviewable source-backed evidence for that range. Messages outside the range are left for another scan.', 'yes', '12 to 25 scans those messages and leaves 26 onward untouched.', 'archive'),
+    rangeClear: info('Clear message range', 'Reset the selected Start and End message points.', 'Clears only the range selection. It does not delete chat messages, evidence, scan history, or database records.', 'no', '', 'archive'),
+    estimateRange: info('Estimate selected range', 'Estimate the size and processing passes for the currently selected Start–End range.', 'Makes no model request and writes no evidence.', 'no', '', 'archive'),
     rangeHide: info('Hide this range', 'Hide the selected messages from the conversation context used for later replies.', 'Changes message visibility, not summary text. Showing them again restores visibility.', 'no', 'Hide 12 to 25 after checking that their summary is complete.', 'archive'),
     rangeShow: info('Show this range', 'Make the selected messages visible to the conversation again.', 'Changes message visibility. It does not remove summaries or their archived markers.', 'no', 'Show 12 to 25 when you want the original scene in context again.', 'archive'),
     ledgerForget: info('Mark unprocessed', 'Remove this ledger row from the list of already archived ranges.', 'Summaries and message visibility stay as they are. Other overlapping ledger rows still count as archived.', 'no', 'Forget the 12 to 25 marker, then deliberately summarize that range again.', 'archive'),
@@ -18,11 +31,11 @@ export const ACTION_HELP = {
     regenerate: info('Rebuild and review', 'Generate a replacement from this record’s recorded sources.', 'Keeps its identity and revisions. Original chat units must be rebuilt in their source chat; invalid source records need correction first.', 'yes', 'Rebuild a recap after correcting one of its source summaries.', 'library'),
     loadDetail: info('Load detail next reply', 'Queue this record’s detailed original sources for the next normal reply.', 'Uses the existing injection budget. It does not rewrite the record or permanently change its activation settings.', 'no', 'Temporarily use the detailed scene behind a short recap.', 'library'),
     previewReply: info('Preview next reply', 'Estimate what the draft will load, then queue a one-reply load or skip.', 'Uses saved records and the shared memory budget. Live World Info and helper selection can add or change matches.', 'no', '', 'story'),
-    selectVisible: info('Select results', 'Select all records matching the current Library search and filters.', 'Updates your selection for condensation, exports and other selected-record tools. No text is changed.', 'no', 'Filter to Day 1 through Day 5, then select those results.', 'library'),
-    clearSelection: info('Clear selection', 'Uncheck the records currently selected in Library.', 'Clears only the selection. Your records and filters are kept.', 'no', '', 'library'),
-    refresh: info('Refresh Library', 'Read this story’s managed books again and recheck recorded evidence.', 'Updates the view. Source or external text changes can be recorded as needing review; no model request is made.', 'no', 'Refresh after editing a lorebook in SillyTavern.', 'library'),
+    selectVisible: info('Select all shown', 'Select all evidence records matching the current search and filters.', 'Updates your selection for condensation, exports and other selected-record tools. No text is changed.', 'no', 'Filter to Day 1 through Day 5, then select those results.', 'library'),
+    clearSelection: info('Clear selected records', 'Uncheck the evidence records currently selected in the browser.', 'Clears only the selection. Your records and filters are kept.', 'no', '', 'library'),
+    refresh: info('Reload database', 'Read this story’s managed database books again and recheck recorded evidence.', 'Updates the view. Source or external text changes can be recorded as needing review; no model request is made.', 'no', 'Refresh after editing a lorebook in SillyTavern.', 'library'),
     quickFilter: info('Quick Library filter', 'Show a useful subset, such as character memories, this chat’s sources or records needing review.', 'Changes the view and filters, not the records themselves.', 'no', 'Use Current chat to focus on records from this timeline.', 'library'),
-    clip: info('Quick capture', 'Save a passage or note with optional dates, people and original-message links.', 'Opens a form. The text is written only after you approve Save capture.', 'no', 'Keep an exact promise that should not be lost inside a long summary.', 'library'),
+    clip: info('Save evidence note', 'Save a passage or note with optional dates, people and original-message links.', 'Opens a form. The text is written only after you approve Save capture.', 'no', 'Keep an exact promise that should not be lost inside a long summary.', 'library'),
     memoriesNext: info('Create next batch', 'Read the next unprocessed archived story units and work out each character’s memories.', 'Prepares character memory updates using your review settings and records which source units were processed.', 'yes', 'Turn the next four archived Days into dated character memories.', 'characters'),
     memoriesAll: info('Create character memories', 'Read original chat, saved units, or both using your chosen scope.', 'Prepares a review and keeps source evidence. Exact ranges can fill a gap in existing memories.', 'yes', 'Read the exact messages containing a missing scene.', 'characters'),
     memoryAudit: info('Review & organize memories', 'Review existing character lists, merge repeated meaning and optionally supply original chat evidence or a correction.', 'Prepares replacements for review. With extra evidence, lists may grow to recover omitted details; original versions are retained.', 'yes', 'Add messages 30 to 40 to recover a detail the earlier summary missed.', 'characters'),
@@ -31,15 +44,16 @@ export const ACTION_HELP = {
     clearCharacter: info('Clear this character’s memories', 'Preview and confirm clearing this character’s managed memory lists.', 'Keeps old text in revisions and Undo, disables emptied records and resets affected processing receipts. Source summaries stay available.', 'no', 'Clear a mistaken list before deliberately re-extracting from corrected source units.', 'characters'),
     clearAllMemories: info('Clear all character memories', 'Preview and confirm clearing every managed character memory list in this story.', 'Keeps revisions and Undo. Empty lists are disabled; source summaries and original chat messages stay available.', 'no', 'Use when intentionally rebuilding this story’s character memories from scratch.', 'characters'),
     forceMemories: info('Re-extract all source units', 'Read all current archived source units again, including those already marked as processed.', 'Prepares reviewed additions and merges them with the lists you keep. It does not automatically clear existing memories.', 'yes', 'Run after improving the memory prompt, or after clearing lists intentionally.', 'characters'),
-    extract: info('Extract from selected', 'Read the source records selected in Library and identify facts, knowledge states and unfinished promises.', 'Creates proposed structured records for review. A shared scene alone does not prove every character knows its secrets.', 'yes', 'Record that Sable is unaware of the contents of a sealed envelope.', 'characters'),
-    newKnowledge: info('Add knowledge', 'Manually record what a character knows, suspects, hides or does not know.', 'Opens a capture form. Saving writes your text and its supplied evidence; no AI is needed.', 'no', 'Record that Rowan learned a fact on Day 3, although the event happened on Day 1.', 'characters'),
-    newFact: info('Add fact', 'Manually save a story fact with optional date, location and source messages.', 'Writes only after you approve the capture form.', 'no', 'The station closes at midnight.', 'characters'),
-    newThread: info('Add promise or thread', 'Manually keep an unresolved promise, question or deadline.', 'Writes only after you approve the capture form.', 'no', 'Rowan promised to return the key by Friday.', 'characters'),
+    extract: info('Extract continuity from selected evidence', 'Read the evidence records you selected and identify facts, knowledge states and unfinished promises.', 'Creates proposed structured records for review. A shared scene alone does not prove every character knows its secrets.', 'yes', 'Record that Sable is unaware of the contents of a sealed envelope.', 'characters'),
+    newKnowledge: info('Add character knowledge', 'Manually record what a character knows, suspects, hides or does not know.', 'Opens a capture form. Saving writes your text and its supplied evidence; no AI is needed.', 'no', 'Record that Rowan learned a fact on Day 3, although the event happened on Day 1.', 'characters'),
+    newFact: info('Add story fact', 'Manually save a story fact with optional date, location and source messages.', 'Writes only after you approve the capture form.', 'no', 'The station closes at midnight.', 'characters'),
+    newThread: info('Add open thread / promise', 'Manually keep an unresolved promise, question or deadline.', 'Writes only after you approve the capture form.', 'no', 'Rowan promised to return the key by Friday.', 'characters'),
     diary: info('Write diary', 'Write a fictional diary using the chosen character’s recorded knowledge by the selected story date.', 'Creates a reviewed diary entry. Diaries are creative writing and are excluded from memory injection by default.', 'yes', 'Write Rowan’s evening entry without revealing information Rowan has not learned.', 'characters'),
+    diaryRewrite: info('Rewrite diary from sources', 'Regenerate the latest diary from all of its still-valid original chat source ranges.', 'You review the replacement before saving. The previous diary text remains in revision history and is not treated as evidence for the rewrite.', 'yes', 'Use when a diary voice or wording is bad but its original source scenes are still correct.', 'characters'),
     knowledgeAt: info('Show dated knowledge', 'Look up the character’s recorded learning dates and explicitly preserved historical knowledge states.', 'Displays dated evidence and separates records with unknown learning dates. It does not infer learning from an event date.', 'no', 'Check what Sable knew before a later revelation.', 'characters'),
     rosterApply: info('Preview identity changes', 'Treat the supplied canonical name and confirmed aliases as the same character.', 'Previews merging matching lists and preserves original record identities. Adds keywords only if you tick that option.', 'no', 'Combine Rowan and Rowan Vale after confirming they are one person.', 'characters'),
-    condenseSelected: info('Condense selected records', 'Use the Library selection to create one linked story arc or shorten individual entries.', 'Reviews the result before saving. Shortening checks each entry’s dates, times, and quotations. A pre-check can skip records that cannot shrink.', 'yes', 'Select several Days and create an Arc recap linked to their originals.', 'condense'),
-    condenseSuggested: info('Review suggested sources', 'Select the records that match your current archive-condensation rules.', 'Opens them in Library for inspection. This button alone does not make a model request or condense them.', 'no', 'Review the proposed older Days before choosing Condense selected records.', 'condense'),
+    condenseSelected: info('Review recap / shortening', 'Use the selected evidence records to create one linked recap or shorten the records individually.', 'Reviews the result before saving. Shortening checks each entry’s dates, times, and quotations. A pre-check can skip records that cannot shrink.', 'yes', 'Select several Days and create an Arc recap linked to their originals.', 'condense'),
+    condenseSuggested: info('Find recap candidates', 'Select the records that match your current archive-condensation rules.', 'Opens them in Library for inspection. This button alone does not make a model request or condense them.', 'no', 'Review the proposed older Days before choosing Condense selected records.', 'condense'),
     suggestRecapGroups: info('Suggest recap groups', 'Read the full text of selected archive entries or an inclusive unit range. Use an optional focus to guide the groups.', 'Review the sources, check for existing recap coverage, and adjust the group before creating a linked recap. The suggestions stay available after reload.', 'yes', 'Group an early promise with the later scene that resolves it.', 'condense'),
     ask: info('Ask the archive', 'Answer your question using relevant records from this story’s managed books.', 'Displays an answer and source buttons. It does not change the saved story records.', 'yes', 'Who last had the marked key?', 'search'),
     continuity: info('Check this claim', 'Compare the text in the question box with relevant recorded story evidence.', 'Shows supported, conflicting or uncertain findings. It does not automatically change canon.', 'yes', 'Check: Sable opened the envelope before the handover.', 'search'),
@@ -107,6 +121,7 @@ export const FIELD_HELP = {
     branchMode: 'Choose what inherited history a copied chat receives before new writes: inherited books, empty books, or only verified earlier history. Parent books are kept.',
     continuityRecent: 'How many newest eligible records Check recent continuity reads. Check whole archive ignores this subset limit.',
     requestBudget: 'Leave at 0 to use the selected model’s context after reserving room for the reply. Enter a positive number to cap helper input. If the connection exposes no context size, automatic mode uses an 18,000-token estimate.',
+    sa_rate_rpm: 'Maximum model request starts per minute, shared by Scene Archivist in this tab. 0 turns off pacing, but not provider cooldowns. Normal RP is unaffected.',
     requestLimit: 'Pause a job before its next model request after this many calls per Resume. 0 allows no fixed request-count limit.',
     budget: 'Memory tokens the extension may retain from entries already selected by native World Info or explicit recall. It does not make unrelated entries eligible.',
     reviewMode: 'Together at the end retains prepared output for one combined approval. After each step reviews and saves each step separately.',
@@ -150,6 +165,21 @@ export function helpFor(control) {
 export const aiLabel = value => value === 'yes' ? 'Uses AI requests' : value === 'maybe' ? 'May use AI requests' : 'No AI request';
 export const helpHtml = data => `<div class="sa-help-badges"><span class="sa-badge ${data.ai === 'no' ? '' : 'sa-ai-badge'}">${aiLabel(data.ai)}</span></div><p>${escape(data.description)}</p>${data.changes ? `<p><b>What changes:</b> ${escape(data.changes)}</p>` : ''}${data.example ? `<p class="sa-help-example"><b>For example:</b> ${escape(data.example)}</p>` : ''}`;
 
+const cleanButtonLabel = control => String(control?.getAttribute?.('aria-label') || control?.value || control?.textContent || '')
+    .replace(/\s+/g, ' ').trim();
+const isCloseButton = control => control?.matches?.('.popup-button-close') || /^close$/i.test(cleanButtonLabel(control));
+const isButtonControl = control => control?.matches?.('button,input[type="button"],input[type="submit"],input.menu_button');
+const inArchivistUi = control => !!(control?.closest?.('.sa-panel,.sa-review,.sa-help-hub,.sa-flashback-picker') ||
+    control?.closest?.('dialog')?.querySelector?.('.sa-review'));
+const genericButtonHelp = control => {
+    if (!isButtonControl(control) || isCloseButton(control) || !inArchivistUi(control) || control.closest?.('.sa-flashback-picker')) return null;
+    const label = cleanButtonLabel(control) || 'Scene Archivist action';
+    if (control.dataset?.saTab) return info(label, `Open the ${label.replace(/^[^A-Za-z0-9]+/, '')} section.`, 'Changes only which Scene Archivist section is visible.', 'no');
+    if (control.hasAttribute?.('aria-pressed')) return info(label, `Toggle ${label.replace(/^[^A-Za-z0-9]+/, '')}.`, 'Changes this view or selection state.', 'no');
+    return info(label, `Use ${label.replace(/^[^A-Za-z0-9]+/, '') || 'this control'}.`, 'This tooltip describes the button; the action itself still requires a click.', 'no');
+};
+const tooltipFor = control => helpFor(control) || genericButtonHelp(control);
+
 /** A tooltip never invokes its target action. Touch help opens a separate dialog. */
 export class ControlHelp {
     constructor(w) {
@@ -158,6 +188,11 @@ export class ControlHelp {
         this.touch = matchMedia('(hover: none), (pointer: coarse)');
         this.touch.addEventListener?.('change', () => this.setExplain(this.explain));
         this.listen = (name, fn, capture = false) => document.addEventListener(name, fn, capture);
+        this.buttonObserver = new MutationObserver(records => {
+            for (const record of records) for (const node of record.addedNodes) if (node instanceof Element) this.titleButtons(node);
+        });
+        this.buttonObserver.observe(document.documentElement, { childList: true, subtree: true });
+        queueMicrotask(() => this.titleButtons(document.documentElement));
         this.listen('pointerover', e => { if (e.pointerType === 'touch') return; const target = this.control(e.target); if (target && !target.contains(e.relatedTarget)) this.schedule(target); });
         this.listen('pointerout', e => { if (this.anchor?.contains(e.target) && !this.anchor.contains(e.relatedTarget)) this.hide(); });
         this.listen('focusin', e => { const target = this.control(e.target); if (target) this.schedule(target, 120); });
@@ -179,18 +214,35 @@ export class ControlHelp {
     observe(root) {
         if (!(root instanceof Element) || this.roots.has(root)) return;
         this.roots.add(root); root.classList.add('sa-help-scope'); root.classList.toggle('sa-explain-on', this.explain);
+        this.titleButtons(root);
         this.refresh(root);
     }
     control(target) {
-        const control = target.closest?.('button.menu_button,input.menu_button,[data-review-include],input.text_pole,select.text_pole,[data-sa-option],[data-sa-field]');
-        if (!control || !control.closest('.sa-help-scope') || control.closest('.sa-help-hub') || !helpFor(control)) return null;
+        const control = target.closest?.('button,input[type="button"],input[type="submit"],input.menu_button,[data-review-include],input.text_pole,select.text_pole,[data-sa-option],[data-sa-field]');
+        if (!control || !inArchivistUi(control) || isCloseButton(control) || !tooltipFor(control)) return null;
         return this.prepare(control);
+    }
+    titleButtons(root = document.documentElement) {
+        if (!(root instanceof Element)) return;
+        const buttons = root.matches?.('button,input[type="button"],input[type="submit"],input.menu_button') ? [root] :
+            [...root.querySelectorAll?.('button,input[type="button"],input[type="submit"],input.menu_button') || []];
+        for (const control of buttons) {
+            if (!inArchivistUi(control) || isCloseButton(control)) {
+                if (isCloseButton(control) && control.dataset?.saTooltipAdded === 'true') control.removeAttribute('title');
+                continue;
+            }
+            const data = tooltipFor(control); if (!data) continue;
+            const title = [data.title, data.description].filter(Boolean).join(' — ');
+            if (title) { control.title = title; control.dataset.saTooltipAdded = 'true'; }
+        }
     }
     prepare(control) {
         if (control.hasAttribute('data-sa-help-ready')) return control;
-        const data = helpFor(control); if (!data) return control;
+        const data = tooltipFor(control); if (!data) return control;
         control.dataset.saHelpReady = 'true';
-        if (control.title) { control.dataset.saOriginalTitle = control.title; control.removeAttribute('title'); }
+        if (control.title && !control.dataset.saOriginalTitle) control.dataset.saOriginalTitle = control.title;
+        control.title = [data.title, data.description].filter(Boolean).join(' — ');
+        control.dataset.saTooltipAdded = 'true';
         control.setAttribute('aria-description', `${data.description} ${data.changes}`.trim());
         return control;
     }
@@ -209,9 +261,9 @@ export class ControlHelp {
         if (!(this.explain || this.touch.matches)) return;
         // Read visibility in one pass before making DOM changes. Interleaving
         // a geometry read with each wrapper forces repeated browser layouts.
-        const controls = [...root.querySelectorAll('button.menu_button,input.menu_button')].filter(control => !control.closest('.sa-help-control,.sa-help-hub') && helpFor(control) && control.getClientRects().length);
+        const controls = [...root.querySelectorAll('button.menu_button,input.menu_button')].filter(control => !control.closest('.sa-help-control,.sa-help-hub') && !isCloseButton(control) && tooltipFor(control) && control.getClientRects().length);
         for (const control of controls) {
-            const data = helpFor(this.prepare(control));
+            const data = tooltipFor(this.prepare(control));
             const wrapper = document.createElement('span'); wrapper.className = 'sa-help-control';
             control.before(wrapper); wrapper.append(control);
             const help = document.createElement('button'); help.type = 'button'; help.className = 'sa-context-help'; help.textContent = '?';
@@ -230,12 +282,12 @@ export class ControlHelp {
         }
     }
     schedule(anchor, delay = 420) {
-        if (!helpFor(anchor) || anchor.closest('[hidden]') || !anchor.getClientRects().length) return;
+        if (!tooltipFor(anchor) || anchor.closest('[hidden]') || !anchor.getClientRects().length) return;
         this.hide(); this.anchor = anchor; this.timer = setTimeout(() => { this.timer = null; this.show(anchor); }, delay);
     }
     show(anchor) {
         if (!anchor.isConnected || !anchor.getClientRects().length) return;
-        const data = helpFor(anchor); if (!data) return;
+        const data = tooltipFor(anchor); if (!data) return;
         const tip = document.createElement('div'); tip.className = 'sa-control-tooltip'; tip.id = 'sa-control-tooltip'; tip.setAttribute('role', 'tooltip');
         tip.innerHTML = `<b>${escape(data.title)}</b>${helpHtml(data)}`;
         (anchor.closest('dialog') || document.body).append(tip); this.tooltip = tip; this.anchor = anchor;

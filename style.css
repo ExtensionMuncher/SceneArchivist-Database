@@ -6,21 +6,9 @@
 }
 .sa-panel :is(.sa-brand-mark, .sa-tabs [aria-hidden="true"]) { font-family: var(--sa-emoji-fonts), sans-serif; }
 .sa-panel .menu_button, .sa-review .menu_button { font-family: inherit; }
-#send_form .sa-flashback-start {
-  display: grid; place-items: center; align-self: center; flex-shrink: 0;
-  width: var(--bottomFormBlockSize, 34px); height: var(--bottomFormBlockSize, 34px);
-  margin: 0; padding: 0; border: 0; border-radius: 6px; background: transparent;
-  color: inherit; font-size: .8em; opacity: .75; cursor: pointer;
-}
-#send_form .sa-flashback-start:hover, #send_form .sa-flashback-start:focus-visible { opacity: 1; }
-#send_form .sa-flashback-start[hidden], .sa-composer-scene[hidden] { display: none !important; }
-.sa-composer-scene {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; order: 24; width: 100%;
-  padding: 5px 8px; color: var(--SmartThemeBodyColor, inherit); font-size: .84em;
-  border-block-end: 1px solid color-mix(in srgb, currentColor 18%, transparent);
-}
-.sa-composer-scene [role="status"] { flex: 1 1 auto; overflow-wrap: anywhere; }
-.sa-composer-scene .menu_button { min-height: 28px; margin: 0; font: inherit; }
+#sa_wand_scene_date[hidden] { display: none !important; }
+#sa_wand_scene_date span { overflow-wrap: anywhere; }
+.sa-flashback-clear { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding-top: 8px; border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent); cursor: pointer; }
 dialog.popup:has(.sa-flashback-picker) {
   width: min(23rem, calc(100dvw - 1rem)); min-height: 0; max-height: calc(100dvh - 1rem);
   padding: 8px 12px 12px;
@@ -57,12 +45,12 @@ dialog.popup:has(.sa-flashback-picker) .popup-button-ok:hover { background: colo
   border-color: currentColor; background: color-mix(in srgb, currentColor 18%, transparent); font-weight: 700;
 }
 .sa-flashback-picker button:disabled { opacity: .4; cursor: default; }
-.sa-flashback-picker button:focus-visible, #send_form .sa-flashback-start:focus-visible {
+.sa-flashback-picker button:focus-visible, #sa_wand_scene_date:focus-visible {
   outline: 2px solid var(--SmartThemeQuoteColor, currentColor); outline-offset: -2px;
 }
 .sa-flashback-picker input:focus-visible { outline-offset: 1px; }
 @media (pointer: coarse) {
-  .sa-composer-scene .menu_button { min-height: 34px; }
+  .sa-flashback-clear { min-height: 44px; }
   .sa-flashback-picker :is(button, input) { min-height: 40px; }
   dialog.popup:has(.sa-flashback-picker) .popup-controls .menu_button { min-height: 40px; }
 }
@@ -312,17 +300,17 @@ dialog:has(.sa-popwrap) .popup-content { padding: 0; }
 .sa-range-message-preview p { display:grid; gap:3px; margin:10px 0; font-size:.85em; }
 .sa-range-message-preview b { color:var(--sa-muted); font-size:.85em; }
 .sa-range-message-preview span { white-space:pre-wrap; }
-/* Match SillyTavern's message toolbar with one accessible action. */
-#chat .sa-message-action {
-  appearance:none; background:transparent; border:0; padding:0; margin:0; color:inherit;
-  cursor:pointer; min-width:22px; min-height:22px; align-self:center; flex:none; opacity:.8;
+/* Only the individually owned optional Archivist button is styled. */
+#chat button[data-scene-archivist-control="message-action"] {
+  display:block; appearance:none; background:transparent; border:1px solid currentColor; border-radius:5px;
+  padding:3px 8px; margin:4px 0 4px auto; font:inherit; font-size:.72em; line-height:1.3; color:inherit;
+  cursor:pointer; min-height:28px; opacity:.8;
 }
-#chat .mes_buttons:has(> .sa-message-action) { align-items:center; }
-#chat .sa-message-action:hover, #chat .sa-message-action[aria-expanded=true] { color:var(--SmartThemeQuoteColor, #d4b8ea); opacity:1; }
-#chat .sa-message-action:focus-visible { outline:2px solid currentColor; outline-offset:2px; border-radius:4px; }
+#chat button[data-scene-archivist-control="message-action"]:is(:hover,[aria-expanded=true]) { color:var(--SmartThemeQuoteColor, #d4b8ea); opacity:1; }
+#chat button[data-scene-archivist-control="message-action"]:focus-visible { outline:2px solid currentColor; outline-offset:2px; }
 .sa-message-menu {
   position:fixed; z-index:9990; display:grid; gap:3px; width:max-content;
-  max-width:calc(100vw - 16px); padding:7px; border:1px solid var(--SmartThemeBorderColor, #5c5261);
+  max-width:calc(100vw - 16px); max-height:calc(100vh - 16px); max-height:calc(100dvh - 16px); box-sizing:border-box; overflow:auto; overscroll-behavior:contain; padding:7px; border:1px solid var(--SmartThemeBorderColor, #5c5261);
   border-radius:10px; background:color-mix(in srgb, var(--SmartThemeBlurTintColor, #211d26) 88%, #202026);
   color:var(--SmartThemeBodyColor, #eeeaf5); box-shadow:0 6px 24px #0007;
 }
@@ -332,30 +320,8 @@ dialog:has(.sa-popwrap) .popup-content { padding: 0; }
   text-align:start; padding:9px; border-radius:5px; cursor:pointer;
 }
 .sa-message-menu > button:is(:hover,:focus-visible) { background:color-mix(in srgb, currentColor 12%, transparent); outline:0; }
-#chat .ch_name:has(.sa-message-badges),
-#chat .ch_name .flex-container:has(.sa-message-badges) { min-inline-size:0; }
-#chat .ch_name :has(> .sa-message-badges) { align-items:center; flex-wrap:nowrap; }
-#chat .ch_name :has(> .sa-message-badges) > :is(.name_text, .timestamp) {
-  min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-}
-.sa-message-badges {
-  display:inline-flex; align-self:center; align-items:center; flex:0 1 auto; min-inline-size:0;
-  gap:4px; margin-inline-start:4px; font-size:.65em; font-weight:400; line-height:1.25;
-}
-.sa-message-badges > span {
-  padding:1px 5px; border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  background:color-mix(in srgb, currentColor 8%, transparent);
-}
-.sa-message-badges > [data-kind=status] { opacity:.72; }
-.sa-message-badges > [data-kind=endpoint] { color:var(--SmartThemeQuoteColor, #d4b8ea); font-weight:600; }
 @media (max-width:720px), (pointer:coarse) {
-  .sa-message-badges[data-mobile=hide] > [data-kind=status],
-  .sa-message-badges[data-mobile=hide]:not(:has(> [data-kind=endpoint])) { display:none; }
-  #chat .ch_name :has(> .sa-message-badges[data-mobile=hide]:not(:has(> [data-kind=endpoint]))) { flex-wrap:wrap; }
-  #chat .ch_name :has(> .sa-message-badges) > .name_text { flex:0 0 auto; max-inline-size:50%; }
-  .sa-message-badges { flex:0 0 auto; max-inline-size:43%; }
-  .sa-message-menu > button { min-height:44px; }
-  #chat .sa-message-action { min-width:38px; min-height:28px; }
+  .sa-message-menu > button, #chat button[data-scene-archivist-control="message-action"] { min-height:44px; }
 }
 .sa-story-home { grid-column:1 / -1; padding:18px; border:1px solid var(--sa-line); border-radius:12px; background:var(--sa-wash); }
 .sa-story-home h3 { margin:6px 0 10px; }
@@ -510,3 +476,310 @@ dialog:has(.sa-prompt-trace) {
 @media (max-width: 500px) {
     .sa-sidebar-workspace > .sa-tabs > button > [aria-hidden=true] { display: none; }
 }
+
+
+/* Database edition UI legibility pass (db.5)
+   Keep all Scene Archivist actions neutral: state is shown by border/weight,
+   never by a dark or saturated fill that competes with the label. */
+.sa-panel :is(button, input[type="button"], input[type="submit"], .menu_button),
+.sa-review :is(button, input[type="button"], input[type="submit"], .menu_button),
+.sa-help-hub :is(button, input[type="button"], input[type="submit"], .menu_button),
+.sa-flashback-picker button {
+  background: transparent !important;
+  color: inherit !important;
+  box-shadow: none !important;
+  filter: none !important;
+  text-shadow: none !important;
+}
+.sa-panel :is(button, input[type="button"], input[type="submit"], .menu_button):not(:disabled),
+.sa-review :is(button, input[type="button"], input[type="submit"], .menu_button):not(:disabled),
+.sa-help-hub :is(button, input[type="button"], input[type="submit"], .menu_button):not(:disabled),
+.sa-flashback-picker button:not(:disabled) {
+  border-color: color-mix(in srgb, currentColor 34%, transparent) !important;
+}
+.sa-panel :is(button, input[type="button"], input[type="submit"], .menu_button):hover:not(:disabled),
+.sa-review :is(button, input[type="button"], input[type="submit"], .menu_button):hover:not(:disabled),
+.sa-help-hub :is(button, input[type="button"], input[type="submit"], .menu_button):hover:not(:disabled),
+.sa-flashback-picker button:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 7%, transparent) !important;
+  color: inherit !important;
+  border-color: color-mix(in srgb, currentColor 58%, transparent) !important;
+}
+.sa-panel :is(button,[role="tab"])[aria-selected="true"],
+.sa-panel button[aria-pressed="true"],
+.sa-review button[aria-pressed="true"],
+.sa-help-hub :is(button,[role="tab"])[aria-selected="true"],
+.sa-help-hub button[aria-pressed="true"],
+.sa-flashback-picker button[aria-pressed="true"] {
+  background: transparent !important;
+  color: inherit !important;
+  border-color: currentColor !important;
+  font-weight: 700;
+  outline: 1px solid color-mix(in srgb, currentColor 34%, transparent);
+  outline-offset: -3px;
+}
+.sa-panel .sa-primary,
+.sa-review .sa-primary,
+.sa-help-scope .sa-primary {
+  background: transparent !important;
+  color: inherit !important;
+  border-color: color-mix(in srgb, currentColor 52%, transparent) !important;
+  font-weight: 700;
+}
+
+/* Every Scene Archivist instruction/review popup must fit inside the viewport.
+   ST 1.19 normally leaves popup-content overflow hidden unless the popup class
+   is set correctly; these rules make the extension safe even if that class is
+   missing or a mobile viewport changes after the dialog opens. */
+dialog.popup:has(.sa-review),
+dialog.popup:has(.sa-help-hub) {
+  width: min(760px, calc(100dvw - 12px)) !important;
+  max-width: calc(100dvw - 12px) !important;
+  max-height: calc(100dvh - 12px) !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+dialog.popup:has(.sa-review) .popup-body,
+dialog.popup:has(.sa-help-hub) .popup-body {
+  min-height: 0 !important;
+  max-height: calc(100dvh - 16px) !important;
+  overflow: hidden !important;
+}
+dialog.popup:has(.sa-review) .popup-content,
+dialog.popup:has(.sa-help-hub) .popup-content {
+  min-height: 0 !important;
+  max-height: calc(100dvh - 84px) !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-bottom: 14px;
+}
+dialog.popup:has(.sa-review) .popup-controls,
+dialog.popup:has(.sa-help-hub) .popup-controls {
+  flex: 0 0 auto;
+  margin-top: 8px;
+}
+.sa-help-detail {
+  width: 100%;
+  max-width: 680px;
+  max-height: none;
+  overflow: visible;
+}
+@media (max-width: 560px), (max-height: 680px) {
+  dialog.popup:has(.sa-review),
+  dialog.popup:has(.sa-help-hub) {
+    width: calc(100dvw - 8px) !important;
+    max-width: calc(100dvw - 8px) !important;
+    max-height: calc(100dvh - 8px) !important;
+    padding: 4px 7px 7px !important;
+  }
+  dialog.popup:has(.sa-review) .popup-content,
+  dialog.popup:has(.sa-help-hub) .popup-content {
+    max-height: calc(100dvh - 68px) !important;
+    margin-top: 4px !important;
+    padding-inline: 4px !important;
+  }
+  .sa-review h3 { font-size: 21px; margin-bottom: 9px; }
+  .sa-help-detail p { margin-block: 7px; }
+}
+
+/* Popup footer actions belong to Scene Archivist too; keep them neutral. */
+dialog.popup:has(.sa-review) .popup-controls .menu_button,
+dialog.popup:has(.sa-help-hub) .popup-controls .menu_button {
+  background: transparent !important;
+  color: inherit !important;
+  border-color: color-mix(in srgb, currentColor 40%, transparent) !important;
+  box-shadow: none !important;
+  filter: none !important;
+}
+dialog.popup:has(.sa-review) .popup-controls .menu_button:hover:not(:disabled),
+dialog.popup:has(.sa-help-hub) .popup-controls .menu_button:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 7%, transparent) !important;
+  color: inherit !important;
+}
+
+
+/* Database edition information architecture cleanup (db.7) */
+.sa-db-home { display:grid; gap:12px; }
+.sa-db-scan-choices { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.sa-db-choice { min-width:0; padding:12px; border:1px solid var(--sa-line); border-radius:10px; background:color-mix(in srgb,currentColor 3%,transparent); }
+.sa-db-choice > b { display:block; font-size:1.02em; margin-bottom:4px; }
+.sa-db-choice > p { margin:0 0 10px; color:var(--sa-muted); line-height:1.45; }
+.sa-db-choice .menu_button { width:100%; justify-content:center; }
+.sa-db-secondary { margin-top:-2px; }
+.sa-control-label { display:block; margin:0 0 5px; font-size:.88em; color:var(--sa-muted); }
+.sa-tool-explainer { display:grid; gap:7px; margin:10px 0; }
+.sa-tool-explainer p { display:grid; grid-template-columns:minmax(110px,.34fr) minmax(0,1fr); gap:10px; margin:0; padding:8px 0; border-top:1px solid var(--sa-line); }
+.sa-tool-explainer p:first-child { border-top:0; }
+.sa-tool-explainer span { color:var(--sa-muted); }
+.sa-panel .sa-card-description { display:block; margin-top:3px; font-weight:400; opacity:.72; max-width:64ch; }
+.sa-panel .sa-card > summary { line-height:1.25; }
+.sa-panel .sa-row { align-items:center; }
+.sa-panel .sa-row > .menu_button { white-space:normal; text-align:center; }
+@media (max-width:680px) { .sa-db-scan-choices { grid-template-columns:minmax(0,1fr); } .sa-tool-explainer p { grid-template-columns:minmax(0,1fr); gap:2px; } }
+
+@media (max-width:720px) {
+  .sa-sidebar-workspace.sa-database-workspace > .sa-tabs { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .sa-sidebar-workspace.sa-database-workspace > .sa-tabs .sa-tools-menu { grid-column:1/-1; }
+}
+
+.sa-debug-log { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60vh; overflow: auto; font-family: monospace; font-size: 0.9em; }
+
+.sa-information-tree .sa-tree-item { border-bottom: 1px solid var(--SmartThemeBorderColor); padding: .5em 0; }
+.sa-information-tree .sa-tree-item .menu_button { width: 100%; min-height: 2.75em; white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.sa-information-tree p { margin: .35em 0; overflow-wrap: anywhere; }
+.sa-information-tree pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* db.25 — quiet, document-oriented database workspace.
+   Scoped to Archivist; no changes to ST's global theme or other extensions. */
+.sa-panel.sa-database-workspace {
+  --sa-accent: var(--SmartThemeQuoteColor, #c9b4ef);
+  --sa-line: color-mix(in srgb, currentColor 19%, transparent);
+  --sa-wash: color-mix(in srgb, currentColor 5%, transparent);
+  border: 0; border-radius: 0; padding: 18px 22px;
+  grid-template-columns: 152px minmax(0,1fr); gap: 0 22px;
+}
+.sa-panel.sa-database-workspace .sa-brand-mark { display:none; }
+.sa-panel.sa-database-workspace .sa-ver { border:0; border-radius:0; padding:0; font-size:10px; font-weight:400; }
+.sa-panel.sa-database-workspace .sa-wordmark { font:600 19px/1.4 system-ui,sans-serif; }
+.sa-panel.sa-database-workspace .sa-title { gap:6px 14px; margin-bottom:16px; }
+.sa-panel.sa-database-workspace .sa-header-actions { gap:4px 12px; }
+.sa-panel.sa-database-workspace .sa-header-actions button { border:0 !important; padding:6px 2px; text-align:left; }
+.sa-panel.sa-database-workspace .sa-page-heading { display:block; padding:0 0 12px; margin:0; }
+.sa-panel.sa-database-workspace .sa-page-heading h2 { font:600 21px/1.3 system-ui,sans-serif; margin:0 0 5px; }
+.sa-panel.sa-database-workspace .sa-dashboard { border-bottom:1px solid var(--sa-line); margin:0 0 12px; padding:0 0 10px; }
+.sa-panel.sa-database-workspace > .sa-tabs { gap:0; padding:0 12px 0 0; background:transparent; }
+.sa-panel.sa-database-workspace > .sa-tabs > button {
+  justify-content:flex-start; text-align:left; font-size:.9em; min-height:39px; padding:8px 11px;
+  border:0 !important; border-inline-start:2px solid transparent !important; border-radius:0; outline-offset:-2px;
+}
+.sa-panel.sa-database-workspace > .sa-tabs > button[aria-selected=true] {
+  border-inline-start-color:var(--sa-accent) !important; background:var(--sa-wash) !important;
+  outline:0; font-weight:650;
+}
+.sa-panel.sa-database-workspace > .sa-tabs > button:focus-visible { outline:2px solid var(--sa-accent) !important; }
+.sa-panel.sa-database-workspace .sa-tools-menu { margin-top:12px; padding-top:8px; }
+.sa-panel.sa-database-workspace .sa-tools-menu > summary { border-radius:0; padding:9px 4px; }
+.sa-panel.sa-database-workspace .sa-tools-links:empty { display:none; }
+.sa-panel.sa-database-workspace .sa-tools-menu .sa-explain-switch { display:flex; margin:8px 4px; }
+/* Full-width accordion rows, not a deck of nested boxes. */
+.sa-panel.sa-database-workspace #sa-pane-archive:not([hidden]), .sa-panel.sa-database-workspace .sa-story-cards {
+  display:block;
+}
+.sa-panel.sa-database-workspace #sa-pane-story:not([hidden]) { gap:8px; }
+.sa-panel.sa-database-workspace .sa-card {
+  border:0; border-bottom:1px solid var(--sa-line); border-radius:0; background:transparent; padding:0; margin:0;
+}
+.sa-panel.sa-database-workspace .sa-card > summary {
+  padding:14px 28px 14px 0; font-size:.98em; line-height:1.4; min-height:44px;
+}
+.sa-panel.sa-database-workspace .sa-card > summary::after {
+  content:''; width:8px; height:8px; border-right:1.5px solid currentColor; border-bottom:1.5px solid currentColor;
+  transform:rotate(-45deg); right:8px; top:19px;
+}
+.sa-panel.sa-database-workspace .sa-card[open] > summary::after { transform:rotate(45deg); top:16px; }
+.sa-panel.sa-database-workspace .sa-card > summary:hover { background:var(--sa-wash); }
+.sa-panel.sa-database-workspace .sa-card[open] > summary { border-bottom:0; margin-bottom:0; }
+.sa-panel.sa-database-workspace .sa-card-description { font-size:.8em; margin-top:4px; opacity:.78; }
+.sa-panel.sa-database-workspace .sa-body { padding:2px 0 16px; }
+.sa-panel.sa-database-workspace .sa-inline-tools { margin:12px 0 0; padding:0; }
+.sa-panel.sa-database-workspace .sa-inline-tools > summary { padding:10px 0; color:inherit; font-weight:550; min-height:38px; }
+.sa-panel.sa-database-workspace .sa-inline-tools[open] > summary { margin-bottom:4px; }
+.sa-panel.sa-database-workspace .sa-story-home { background:transparent; border:0; border-radius:0; padding:0 0 12px; }
+.sa-panel.sa-database-workspace .sa-story-home h3 { font:600 21px/1.35 system-ui,sans-serif; }
+.sa-panel.sa-database-workspace .sa-db-scan-choices { display:block; margin-top:12px; }
+.sa-panel.sa-database-workspace .sa-db-choice { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:3px 16px; align-items:center; padding:13px 0; border:0; border-top:1px solid var(--sa-line); background:transparent; border-radius:0; }
+.sa-panel.sa-database-workspace .sa-db-choice > b { grid-column:1; margin:0; }
+.sa-panel.sa-database-workspace .sa-db-choice > p { grid-column:1; margin:0; font-size:.84em; }
+.sa-panel.sa-database-workspace .sa-db-choice > :is(button,.sa-help-control) { grid-column:2; grid-row:1/3; width:auto; justify-self:end; }
+.sa-panel.sa-database-workspace .sa-start-banner, .sa-panel.sa-database-workspace #sa-pane-archive > .sa-more-tools { padding:12px 0; border:0; border-radius:0; background:transparent; }
+.sa-panel.sa-database-workspace .sa-job, .sa-panel.sa-database-workspace .sa-selection-strip, .sa-panel.sa-database-workspace .sa-automation-notice {
+  border-radius:0; border:0; border-inline-start:2px solid var(--sa-accent); background:var(--sa-wash); padding:10px 12px;
+}
+.sa-panel.sa-database-workspace .sa-row { gap:6px 10px; margin:8px 0; }
+.sa-panel.sa-database-workspace .sa-grid { gap:10px 14px; }
+.sa-panel.sa-database-workspace .sa-field { gap:4px; }
+.sa-panel.sa-database-workspace .text_pole, .sa-review .text_pole { border-radius:3px; box-shadow:none; }
+/* Primary operations remain buttons, routine text actions read like links. */
+.sa-panel.sa-database-workspace .menu_button, .sa-panel.sa-database-workspace .sa-toolbar-button, .sa-review .menu_button, .sa-help-hub button {
+  border-radius:3px !important; box-shadow:none !important; min-height:34px; padding:6px 10px;
+}
+.sa-panel.sa-database-workspace .sa-primary, .sa-panel.sa-database-workspace [data-sa-action="diary"] {
+  background:var(--sa-wash) !important; border-color:var(--sa-accent) !important; font-weight:650;
+}
+.sa-panel.sa-database-workspace :is(.sa-text-button, [data-sa-action="inspect"], [data-sa-action="sources"], [data-sa-action="refresh"], [data-sa-action="estimateThorough"], [data-sa-action="selectVisible"], [data-sa-action="clearSelection"], [data-sa-action="debugView"]) {
+  border:0 !important; border-radius:0; padding-inline:3px; text-decoration:underline; text-underline-offset:3px; text-align:left;
+}
+.sa-panel.sa-database-workspace .sa-badge, .sa-review .sa-badge { border:0; border-radius:0; padding:0; opacity:.75; font-size:.76em; }
+.sa-panel.sa-database-workspace .sa-result { padding:12px 0; }
+.sa-panel.sa-database-workspace .sa-result .sa-row { margin:4px 0 0; }
+.sa-panel.sa-database-workspace :is(.sa-library-nav,.sa-quick-filters), .sa-review .sa-review-filters, .sa-help-hub .sa-guide-tabs { gap:0; border-bottom:1px solid var(--SmartThemeBorderColor, #777); }
+.sa-panel.sa-database-workspace :is(.sa-library-nav,.sa-quick-filters) button, .sa-review .sa-review-filters button, .sa-help-hub .sa-guide-tabs button {
+  border:0 !important; border-bottom:2px solid transparent !important; border-radius:0 !important;
+  background:transparent !important; padding:8px 11px; font-size:.86em; outline:0;
+}
+.sa-panel.sa-database-workspace :is(.sa-library-nav,.sa-quick-filters) button[aria-pressed=true], .sa-review .sa-review-filters button[aria-pressed=true], .sa-help-hub .sa-guide-tabs button[aria-selected=true] {
+  border-bottom-color:var(--sa-accent, currentColor) !important; font-weight:650;
+}
+.sa-panel.sa-database-workspace :is(.sa-library-nav,.sa-quick-filters) button:focus-visible, .sa-review .sa-review-filters button:focus-visible, .sa-help-hub .sa-guide-tabs button:focus-visible { outline:2px solid currentColor !important; outline-offset:-2px; }
+.sa-panel.sa-database-workspace .sa-timeline-index { gap:0; }
+.sa-panel.sa-database-workspace .sa-timeline-link { border:0 !important; border-bottom:1px solid var(--sa-line) !important; border-inline-start:2px solid transparent !important; border-radius:0; background:transparent !important; text-align:start; }
+.sa-panel.sa-database-workspace .sa-timeline-link[aria-pressed=true] { border-inline-start-color:var(--sa-accent) !important; background:var(--sa-wash) !important; outline:0; }
+.sa-panel.sa-database-workspace .sa-timeline-detail { border:0; border-inline-start:1px solid var(--sa-line); border-radius:0; padding:0 0 0 14px; }
+.sa-panel.sa-database-workspace .sa-little-list, .sa-panel.sa-database-workspace .sa-empty-state { border:0; border-radius:0; padding:8px 0; }
+.sa-panel.sa-database-workspace #sa-character-memories .sa-prose { border-radius:0; background:transparent; padding:8px 0; }
+.sa-panel.sa-database-workspace .sa-diary-reader { font-size:.95em; line-height:1.65; opacity:1; color:inherit; padding:12px 0; border-block:1px solid var(--sa-line); margin:12px 0; }
+.sa-panel.sa-database-workspace .sa-diary-reader:empty { display:none; }
+.sa-panel.sa-database-workspace .sa-information-tree .sa-tree-item .menu_button, .sa-review.sa-information-tree .sa-tree-item .menu_button { border:0 !important; border-radius:0; text-align:left; padding:8px 2px; }
+.sa-review details:not(.sa-inline-tools) { border:0; border-bottom:1px solid var(--SmartThemeBorderColor, #555); border-radius:0; padding:10px 0; margin:0; }
+.sa-review .sa-context-help, .sa-panel.sa-database-workspace .sa-context-help { border-radius:0 3px 3px 0; }
+.sa-panel.sa-database-workspace:not(.sa-explain-on) .sa-context-help { display:none; }
+.sa-panel.sa-database-workspace:not(.sa-explain-on) .sa-help-control > .menu_button { border-radius:3px !important; }
+.sa-panel.sa-database-workspace .sa-help-control { max-width:100%; min-width:0; }
+.sa-panel.sa-database-workspace .sa-help-control > .menu_button { min-width:0; overflow-wrap:anywhere; }
+@media (max-width:720px) {
+  .sa-panel.sa-database-workspace { padding:12px 10px; }
+  .sa-sidebar-workspace.sa-panel.sa-database-workspace > .sa-tabs, #sa_drawer .sa-sidebar-workspace.sa-panel.sa-database-workspace > .sa-tabs { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:0; padding:0; border:0; border-bottom:1px solid var(--sa-line); margin-bottom:14px; }
+  .sa-panel.sa-database-workspace > .sa-tabs > button { justify-content:center; text-align:center; border-inline-start:0 !important; border-bottom:2px solid transparent !important; font-size:.82em; padding:8px 2px; }
+  .sa-panel.sa-database-workspace > .sa-tabs > button[aria-selected=true] { border-bottom-color:var(--sa-accent) !important; }
+  .sa-panel.sa-database-workspace .sa-tabs .sa-tools-menu { grid-column:1/-1; margin:0; padding:0; border:0; }
+  .sa-panel.sa-database-workspace .sa-tabs .sa-tools-menu > summary { padding:8px 2px; }
+  .sa-panel.sa-database-workspace .sa-db-choice { display:block; }
+  .sa-panel.sa-database-workspace .sa-db-choice > :is(button,.sa-help-control) { margin-top:9px; width:auto; }
+  .sa-panel.sa-database-workspace .sa-db-choice > p { margin-top:4px; }
+  .sa-panel.sa-database-workspace .sa-timeline-detail { border-inline-start:0; padding:8px 0 0; }
+  .sa-panel.sa-database-workspace .sa-row > .sa-help-control { flex:0 1 auto; }
+}
+@media (pointer:coarse) {
+  .sa-panel.sa-database-workspace :is(.menu_button,.sa-toolbar-button,.sa-text-button,.sa-tabs button,.sa-inline-tools > summary,.sa-card > summary), .sa-review .menu_button { min-height:44px; }
+  .sa-panel.sa-database-workspace .text_pole { min-height:44px; }
+}
+
+/* Keep the narrow extension drawer usable even on a wide monitor. */
+#sa_drawer .sa-panel.sa-database-workspace { padding:12px 10px; }
+#sa_drawer .sa-panel.sa-database-workspace > .sa-tabs { grid-template-columns:repeat(4,minmax(0,1fr)); padding:0; gap:0; border:0; border-bottom:1px solid var(--sa-line); margin-bottom:12px; }
+#sa_drawer .sa-panel.sa-database-workspace > .sa-tabs > button { justify-content:center; text-align:center; border-inline-start:0 !important; border-bottom:2px solid transparent !important; padding:8px 2px; font-size:.82em; }
+#sa_drawer .sa-panel.sa-database-workspace > .sa-tabs > button[aria-selected=true] { border-bottom-color:var(--sa-accent) !important; }
+#sa_drawer .sa-panel.sa-database-workspace .sa-tools-menu { grid-column:1/-1; }
+#sa_drawer .sa-panel.sa-database-workspace .sa-db-choice { display:block; }
+#sa_drawer .sa-panel.sa-database-workspace .sa-db-choice > :is(button,.sa-help-control) { margin-top:9px; }
+#sa_drawer .sa-panel.sa-database-workspace .sa-grid { grid-template-columns:minmax(0,1fr); }
+#sa_drawer .sa-panel.sa-database-workspace .sa-timeline-reader { grid-template-columns:minmax(0,1fr); }
+#sa_drawer .sa-panel.sa-database-workspace .sa-timeline-detail { border-inline-start:0; padding:8px 0 0; }
+.sa-panel.sa-database-workspace .sa-timeline-link:focus-visible { outline:2px solid var(--sa-accent) !important; outline-offset:-2px; }
+
+/* Formatting-only Markdown readers, not another layer of cards. */
+.sa-panel .sa-markdown,.sa-review .sa-markdown {white-space:normal;overflow-wrap:anywhere;text-align:left;line-height:1.55;}
+.sa-panel .sa-markdown :is(p,ul,ol,blockquote,pre,table),.sa-review .sa-markdown :is(p,ul,ol,blockquote,pre,table) {margin:.45em 0;}
+.sa-markdown :is(h1,h2,h3,h4,h5,h6) {font-size:1.04em;line-height:1.4;margin:.7em 0 .35em;font-weight:600;}
+.sa-markdown :is(ul,ol) {padding-inline-start:1.5em;}
+.sa-markdown blockquote {padding-inline-start:.8em;border-inline-start:2px solid var(--SmartThemeBorderColor);}
+.sa-markdown pre {white-space:pre-wrap;overflow-wrap:anywhere;}
+.sa-markdown table {border-collapse:collapse;max-width:100%;}
+.sa-markdown :is(td,th) {padding:.2em .4em;border:1px solid var(--SmartThemeBorderColor);}
+.sa-record-preview {max-height:12em;overflow:auto;}
+.sa-bulk-diary-list {max-height: min(46dvh, 420px);overflow:auto;}
+.sa-bulk-diary-row {display:flex;align-items:flex-start;gap:8px;padding:8px 0;border-bottom:1px solid var(--SmartThemeBorderColor);}
+.sa-bulk-diary-row span {flex:1;min-width:0;}
+.sa-bulk-diary-row small {display:block;opacity:.75;margin-top:2px;}

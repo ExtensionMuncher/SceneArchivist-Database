@@ -30,7 +30,7 @@ export function verifiedRange(range, source, sourceId, chat) {
 export function originalCurrent(row, sourceId, chat) {
     const source = row.original?.source;
     return !!source && Array.isArray(source.ranges) && source.ranges.length > 0 && source.ranges.every(range => verifiedRange(range, source, sourceId, chat)
-        && range.messages.every(message => !chat[message.index].is_system)
+        && range.messages.every(message => M.storyMessage(chat[message.index]))
         && recordSources(M.record(row.parent)).some(parentSource => parentSource.chatId === sourceId && ranges(parentSource).some(parentRange =>
             parentRange?.from <= range.from && parentRange.to >= range.to && verifiedRange(parentRange, parentSource, sourceId, chat))));
 }
@@ -92,7 +92,7 @@ export function originalScenes(entries, { chat = [], sourceId, storyId, scopeRea
             for (let start = range.from; start <= range.to; start += Math.max(1, limits.passageMessages - 2)) {
                 const end = Math.min(range.to, start + limits.passageMessages - 1);
                 const messages = range.messages.slice(start - range.from, end - range.from + 1);
-                if (messages.some(message => chat[message.index].is_system)) continue;
+                if (messages.some(message => !M.storyMessage(chat[message.index]))) continue;
                 const content = messages.map(message => {
                     const current = chat[message.index];
                     return `[#${message.index}] ${current.is_user ? 'User' : 'Character'} ${current.name || 'Unnamed'}:\n${String(current.mes || '')}`;

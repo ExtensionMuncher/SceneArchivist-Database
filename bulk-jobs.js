@@ -71,9 +71,19 @@ export class BulkRun {
         }
         this.data = restoreDraft(this.job.draft);
         this.data.meta.workbench.telemetry = this.w.liveState().telemetry;
+        // User-controlled cast and blacklist settings are live controls, not
+        // outputs of a scan. A paused draft must not resurrect old values.
+        for (const key of ['diaryCast', 'diaryPolicies']) {
+            if (Object.hasOwn(this.w.liveState(), key)) this.data.meta.workbench[key] = M.copy(this.w.liveState()[key]);
+            else delete this.data.meta.workbench[key];
+        }
         // Limits may be raised before retrying a retained job. Story prompts,
         // destinations and the queued selection remain the original snapshot.
-        const live = this.real.settings().workbench;
+        const liveSettings = this.real.settings();
+        // Connection changes must take effect when resuming a saved bulk draft.
+        // Story instructions, destinations and evidence remain frozen.
+        this.data.settings.sideProfile = liveSettings.sideProfile || '';
+        const live = liveSettings.workbench;
         if (Number.isFinite(live?.requestBudget)) {
             const options = (this.data.settings.workbench ??= {});
             options.requestBudget = live.requestBudget;
@@ -112,7 +122,7 @@ export class BulkRun {
         try { return await fn(); }
         finally { w.h = previous; w.bulkRun = null; }
     }
-    async acceptArchive(text, source, stepId, placement = null, combined = false) {
+    async acceptArchive(text, source, stepId, placement = null, combined = false, fallbackDate = '') {
         const w = this.w, d = this.data, name = d.settings.lorebook;
         const data = M.copy(d.books[name] || { entries: {} }), before = M.copy(data);
         const { parsed, plan, littleThings: proposed } = await this.real.prepareArchive(text, data, source, placement);
@@ -121,6 +131,19 @@ export class BulkRun {
         }
         const applied = Core.applyPlan(data, plan, parsed, this.real.options(), book => this.real.makeEntry(name, book));
         const changed = M.captureChanges(data, before, Core.classifyEntry, { storyId: w.state().storyId, source, reason: 'Archive write' });
+        const storyDate = M.calendarDay(fallbackDate);
+        if (storyDate) {
+            const changedIds = new Set(changed);
+            for (const e of Object.values(data.entries)) {
+                const r = M.record(e);
+                if (!r || r.type !== 'unit' || !changedIds.has(r.id)) continue;
+                const known = (r.dates || []).map(M.calendarDay).filter(Boolean);
+                if (!known.length) {
+                    e.content = String(e.content || '').replace(/^(## ► .+?\s+(?:\d+|\?)\s*[—–]\s*)(?:Unknown(?: Date)?|Date Unknown|\?)(.*)$/mi, `$1${storyDate}$2`);
+                    r.dates = [storyDate]; r.contentHash = M.hash(e.content); r.lastContent = e.content; r.updated = M.now();
+                }
+            }
+        }
         for (const e of Object.values(data.entries)) if (M.record(e)?.storyId === w.state().storyId) e.sceneArchivistArchive = name;
         if (!this.job.options.automatic && proposed?.length) addLittleThings(data, w.archiveLittleThings(proposed, source), w.state().storyId);
 
@@ -235,8 +258,14 @@ export class BulkRun {
         for (const c of pending.filter(c => c.conflict)) c.include = false;
     }
 
-    discardConflict(change) {
+    discardProposal(change) {
         const d = this.data, job = this.job, { book, uid } = change;
+        if (change.note) {
+            setLittleThings(d.books[book], littleThings(d.books[book]).filter(note => note.id !== change.note.id));
+            d.dropped = (d.dropped || 0) + 1;
+            delete job.reviewEdits?.[proposalKey(change)];
+            return;
+        }
         const proposed = d.books[book].entries[uid], saved = d.before[book]?.entries?.[uid], r = M.record(proposed);
         if (saved) d.books[book].entries[uid] = M.copy(saved);
         else delete d.books[book].entries[uid];
@@ -259,6 +288,7 @@ export class BulkRun {
     }
     async saveApproval() {
         const job = this.job, d = this.data, approval = job.approval;
+        this.w.assertDiaryJob?.(job);
         this.w.renderJob();
         this.real.undoStart();
         const archive = this.real.settings().lorebook;
@@ -296,6 +326,7 @@ export class BulkRun {
             for (const c of approval.accepted.filter(c => c.book === name)) {
                 if (c.noteId) {
                     job.approvedRecords = M.unique([...(job.approvedRecords || []), c.noteId]);
+                    delete job.reviewEdits?.[proposalKey({ book: name, id: c.noteId })];
                     continue;
                 }
                 const proposedReceipt = M.record(d.books[name].entries[c.uid])?.memoryReceipt;
@@ -303,6 +334,7 @@ export class BulkRun {
                 if (proposedReceipt && M.record(d.books[name].entries[c.uid])) M.record(d.books[name].entries[c.uid]).memoryReceipt = proposedReceipt;
                 const id = M.record(saved.entries[c.uid])?.id;
                 job.approvedRecords = M.unique([...(job.approvedRecords || []), id || `${name}:${c.uid}`]);
+                delete job.reviewEdits?.[proposalKey({ book: name, uid: c.uid })];
             }
         }
         this.real.saveSettings();
@@ -338,6 +370,7 @@ export class BulkRun {
     async finish(readyOnly = false) {
         await this.initialize();
         const d = this.data, w = this.w, job = this.job;
+        w.assertDiaryJob?.(job);
         if (job.approval) return this.saveApproval();
         await this.validate();
         if (job.status !== 'running') return false;
@@ -373,6 +406,7 @@ export class BulkRun {
                     const { memoryWarning, stepId, ...metrics } = d.metrics?.[r.id] || {};
                     Object.assign(change, metrics);
                     if (memoryWarning) change.warning = [change.warning, memoryWarning].filter(Boolean).join(' ');
+                    if (Array.isArray(r.scannedDiaryAuthors) && r.scannedDiaryAuthors.length) change.evidence = [change.evidence, ...r.scannedDiaryAuthors.filter(a=>a&&typeof a.name==='string'&&typeof a.text==='string').map(a=>`Diary author guidance — ${a.name}: ${a.text}`)].filter(Boolean).join('\n');
                     if (change.conflict && Object.hasOwn(change.conflict, 'original')) {
                         change.beforeLabel = 'Saved in World Info';
                         delete change.beforeTokens;
@@ -392,7 +426,7 @@ export class BulkRun {
                 const order = ['Archive', 'Memories', 'Trackers', 'Diaries', 'Little Things'];
                 changes.sort((a, b) => order.indexOf(a.section) - order.indexOf(b.section));
                 const note = (readyOnly ? 'Review the prepared results while the remaining stage waits for a retry.' : 'Review the complete run together.')
-                    + (conflicts ? ' You can save unaffected results now. Held proposals stay here for review unless you discard them individually.' : '')
+                    + (conflicts ? ' You can save unaffected results now. Held proposals stay here unless marked for discard.' : '')
                     + (d.notices.length ? '\n\n' + d.notices.join('\n') : '');
                 const approved = changes.length ? await w.review(changes, readyOnly ? 'Review ready results' : 'Review complete run', note, { partial: true })
                     : await this.real.confirmText(note, { cancelButton: 'Review later' });
@@ -401,18 +435,15 @@ export class BulkRun {
                     this.real.notify('Another World Info edit arrived during review. Reopen the review to see the saved changes.', 'info');
                     return false;
                 }
-                const discarded = changes.filter(c => c.conflict && c.discard);
-                for (const c of discarded) this.discardConflict(c);
+                const discarded = changes.filter(c => c.discard);
+                for (const c of discarded) this.discardProposal(c);
+                const remaining = changes.filter(c => !discarded.includes(c));
+                this.holdConflicts(remaining);
                 if (discarded.length) await this.real.saveMeta();
-                for (const c of changes) {
+                for (const c of remaining) {
                     if (c.conflict) continue;
                     if (c.note) {
-                        if (c.include === false) {
-                            const book = d.books[c.book];
-                            setLittleThings(book, littleThings(book).filter(note => note.id !== c.note.id));
-                            delete job.reviewEdits?.[proposalKey(c)];
-                            continue;
-                        }
+                        if (c.include === false) continue;
                         if (c.note.text !== c.content) c.note.quote = '';
                         c.note.text = c.content;
                         continue;
@@ -427,11 +458,12 @@ export class BulkRun {
                         else e.content = c.content;
                     }
                 }
-                const selection = approvedChanges(changes.filter(c => !c.note && !discarded.includes(c)), d.before, d.books);
-                selection.accepted.push(...changes.filter(c => c.note && c.include !== false));
+                const selection = approvedChanges(remaining.filter(c => !c.note), d.before, d.books);
+                selection.accepted.push(...remaining.filter(c => c.note && c.include !== false));
+                selection.deferred.push(...remaining.filter(c => c.note && c.include === false));
                 if (selection.blocked.length) this.real.notify('Results with unselected or missing source entries are still in the draft.', 'info');
                 if (readyOnly || selection.deferred.length) {
-                    if (!selection.accepted.length) return false;
+                    if (!selection.accepted.length) { if (discarded.length) { await this.real.saveMeta(); await w.loadBooks(); await w.render(); this.real.notify(`Discarded ${discarded.length} proposals. ${selection.deferred.length} results remain for review.`, 'success'); } return false; }
                     const books = M.copy(d.before);
                     for (const c of selection.accepted) {
                         if (c.note) {
@@ -484,7 +516,8 @@ export class BulkRun {
         }
         // Keep the durable live job rather than copying a job into itself.
         const live = this.w.liveState();
-        const { recapSuggestions, ...preparedState } = M.copy(d.meta.workbench);
+        // User-edited interpretation settings remain live, even when approving an older draft.
+        const { recapSuggestions, storyContexts, diaryCast, diaryPolicies, ...preparedState } = M.copy(d.meta.workbench);
         Object.assign(live, preparedState);
         live.applied = M.unique([...(live.applied || []), job.id, ...job.steps.map(s => s.id)]);
         if (d.dropped && d.archiveRanges.length) d.meta.lastDay = Core.managedSummary(d.books[archive]).lastDay;
@@ -497,7 +530,7 @@ export class BulkRun {
         job.phase = 'done'; await this.real.saveMeta();
         await this.real.refreshInfo?.();
         await w.loadBooks(); await w.render();
-        const outcome = d.dropped ? ` Discarded ${d.dropped} held ${d.dropped === 1 ? 'proposal' : 'proposals'}.` : '';
+        const outcome = d.dropped ? ` Discarded ${d.dropped} ${d.dropped === 1 ? 'proposal' : 'proposals'}.` : '';
         this.real.notify(`Finished ${job.steps.length} processing steps. All accepted changes were saved.${outcome}`, 'success');
         return true;
     }

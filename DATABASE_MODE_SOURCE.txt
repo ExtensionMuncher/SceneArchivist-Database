@@ -1,0 +1,4 @@
+Upstream: AmiBastian/SillyTavern-SceneArchivist
+Commit: af90a56dd46bfa995fd996f8c77548f1d40710f5
+Version: 2.1.11
+Fork version: 2.2.0-db.1

@@ -31,7 +31,7 @@ export function mergeEvidenceRankings(...rankings) {
 }
 
 /** Recognize list boundaries without flattening continuations or nested bullets. */
-export function memoryBlocks(content) {
+export function memoryBlocks(content, allowSingle = false) {
     const lines = String(content ?? '').split('\n');
     const blocks = [];
     let header = null, group = null, groupUsed = true, start = null;
@@ -63,7 +63,7 @@ export function memoryBlocks(content) {
         }
     }
     finish(lines.length - 1);
-    return groupUsed && blocks.length > 1 ? blocks : [];
+    return groupUsed && blocks.length >= (allowSingle ? 1 : 2) ? blocks : [];
 }
 
 const literalMetadata = (values, words) => {

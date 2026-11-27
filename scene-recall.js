@@ -99,7 +99,7 @@ export class SceneRecall {
             catch { return M.tokens(value) + 4; }
         };
         const eligible = automatic ? ranked : ranked.filter(item => requested.has(item.note.id));
-        const cutoff = automatic && frame.flashback ? `The scene is a flashback. Use story knowledge up to ${frame.flashback}.` : '';
+        const cutoff = automatic && frame.flashback ? `The active story scene date is ${frame.flashback}. Use only story knowledge established on or before that date.` : '';
         const packed = await packLittleThings(eligible, budget, count, cutoff);
         const records = automatic ? recordRecall(entries.filter(e => {
             if (excluded(e)) return false;
@@ -109,11 +109,15 @@ export class SceneRecall {
         return { packed, records, ranked: eligible };
     }
 
-    restriction({ live = false } = {}) {
-        if (!this.w.options().sceneRecall) return () => '';
+    cutoff({ live = false } = {}) {
+        if (!this.w.options().sceneRecall) return '';
         const run = this.run;
-        const frame = !live && run && !run.finished && run.frame || this.frame();
-        return frame.flashback ? entry => flashbackReason(entry, frame) : () => '';
+        return (!live && run && !run.finished && run.frame || this.frame()).flashback || '';
+    }
+
+    restriction(options = {}) {
+        const flashback = this.cutoff(options);
+        return flashback ? entry => flashbackReason(entry, {flashback}) : () => '';
     }
 
     selection() { return this.run?.packed || { items: [], tokens: 0 }; }

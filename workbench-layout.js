@@ -12,30 +12,41 @@ export const TAB_GUIDE = {
     settings: { icon: '⚙️', label: 'Settings', title: 'Make it work your way.', note: 'Choose prompts and connections, set delivery, and keep a story backup.' },
 };
 
+const DATABASE_TAB_GUIDE = {
+    story: { icon: '🏠', label: 'Overview', note: 'See database status and scan all new story messages.' },
+    archive: { icon: '🎯', label: 'Scan', title: 'Scan a specific part of the chat.', note: 'Choose an exact message range and review scan history.' },
+    characters: { icon: '🧩', label: 'Knowledge', title: 'Structured continuity.', note: 'Browse and record facts, knowledge states, aliases, and open threads.' },
+    library: { icon: '🔎', label: 'Evidence', title: 'Search the evidence database.', note: 'Find records, inspect sources, ask questions, and select evidence for other tools.' },
+    maintain: { icon: '🛠️', label: 'Manage', note: 'Recaps, repairs, normalization, backups, and database maintenance.' },
+    prompt: { icon: '🧰', label: 'Retrieval', note: 'Configure the explicit tools the main model can use to query Scene Archivist.' },
+    settings: { icon: '⚙️', label: 'Settings', title: 'Database behavior and models.', note: 'Configure scan thresholds, helper models, prompts, and database settings.' },
+};
+
 // Essential sections remain visible. Advanced sections are revealed in place,
 // preserving their DOM, bindings, form values and any queued work.
 const SECTIONS = [
+    ['#sa-archive-vector-status', 'archive-semantic-search', 'Configure independent embedding model and on-demand search.', false],
     ['#sa-last-prompt', 'prompt-trace', 'Follow the memory trail for a reply.', false],
     ['#sa-profile-scope', 'settings-setup', 'Check this chat and save scoped workflow settings.', false],
     ['[data-sa-flow="persona"]', 'settings-flow-context', 'Optional persona memories and reference lore.', false],
     ['[data-sa-flow="rolling"]', 'settings-flow-automation', 'Optional rolling memories and combined generation.', true],
-    ['#sa_lorebook', 'archive-book', 'Choose the book and summarize new messages.', false],
-    ['[data-sa-action="rangePreview"]', 'archive-range', 'Choose an exact scene before sending it to the model.', false],
-    ['#sa_ledger', 'archive-ledger', 'See what has been processed and redo a saved range.', false],
-    ['[data-sa-action="tidy"]', 'archive-tidy', 'Reorder and group entries without an AI rewrite.', false],
+    ['#sa_lorebook', 'archive-book', 'Choose the story database used by this chat.', false],
+    ['[data-sa-action="rangePreview"]', 'archive-range', 'Choose and preview an exact message range before scanning it.', false],
+    ['#sa_ledger', 'archive-ledger', 'See which message ranges have already been scanned and rescan them when needed.', false],
+    ['[data-sa-action="tidy"]', 'archive-tidy', 'Normalize managed record order without an AI rewrite.', false],
     ['[data-sa-action="repairStale"]', 'archive-repair', 'Rebuild records affected by corrected sources.', false],
     ['#sa-character-memories', 'character-browser', 'Read one character’s memories and review proposed updates.', false],
     ['[data-sa-action="memoriesAll"]', 'character-create', 'Create memories from chat, archive units, or both.', false],
     ['#sa_mem_target', 'character-settings', 'Destinations, source units, batch size and extraction prompt.', true],
     ['#sa_tr_sel', 'character-trackers', 'Keep extra notes such as relationships or inventory.', true],
-    ['[data-sa-action="extract"]', 'character-facts', 'Record knowledge, facts and unresolved promises.', true],
-    ['[data-sa-action="diary"]', 'character-diary', 'Write, update, and condense a private diary from chat and attached lore.', true],
+    ['[data-sa-action="extract"]', 'character-facts', 'Record searchable facts, knowledge states and unresolved threads.', true],
+    ['[data-sa-action="diary"]', 'character-diary', 'Write and review a private diary from the character’s own evidence.', false],
     ['[data-sa-action="knowledgeAt"]', 'character-knowledge', 'Check learning dates and historical knowledge states.', true],
     ['[data-sa-action="rosterApply"]', 'character-roster', 'Confirm aliases and combine matching memory lists.', true],
-    ['#sa-library-results', 'library-records', 'Search, filter, inspect and select saved records.', false],
+    ['#sa-library-results', 'library-records', 'Search, filter, inspect and select source-backed evidence.', false],
     ['[data-sa-action="protectSelected"]', 'library-selected', 'Protect, export or repair the records you select.', false],
-    ['[data-sa-action="condenseSelected"]', 'condense-archive', 'Turn selected story units into a smaller linked recap.', false],
-    ['#sa-evidence-results', 'search-answer', 'Answers and continuity findings with source buttons.', false],
+    ['[data-sa-action="condenseSelected"]', 'condense-archive', 'Create a linked recap or shorten selected evidence records.', false],
+    ['#sa-evidence-results', 'search-answer', 'Ask the database or check continuity with cited evidence.', false],
     ['#sa-budget-view', 'search-loading', 'See separate keyword, vector and other activation reasons.', false],
     ['#sa_view_sum', 'search-context', 'Inspect the archive entries recorded for the last reply.', false],
     ['#sa_recap', 'search-return', 'A short recap to help you return to the story.', true],
@@ -61,34 +72,35 @@ const byAction = (root, action) => root.querySelector(`[data-sa-action="${action
 
 export class WorkspaceLayout {
     constructor(w) {
-        this.w = w; this.root = w.root; this.preferences = readPreferences(); this.help = new ControlHelp(w); this.guideNumber = 0;
+        this.w = w; this.root = w.root; this.preferences = readPreferences(); this.help = new ControlHelp(w); this.guideNumber = 0; this.tabGuide = w.h.settings().databaseOnly ? DATABASE_TAB_GUIDE : TAB_GUIDE;
         this.mount();
     }
     savePreferences() { try { localStorage.setItem('sa.interface.1', JSON.stringify(this.preferences)); } catch { /* A blocked store still permits the current view. */ } }
     mount() {
         const root = this.root;
-        root.classList.add('sa-workspace');
-        const labels = { sa_lorebook: 'Story archive lorebook', sa_newname: 'New archive name', sa_tr_sel: 'Tracker', sa_pl_sel: 'Archive prompt preset', sa_pl_name: 'Prompt name', sa_prompt: 'Archive prompt', sa_mem_prompt: 'Character memory prompt', sa_cond_prompt: 'Organize existing memories prompt', sa_mem_shorten_prompt: 'Shorten character memories prompt', sa_tr_prompt: 'Tracker prompt', sa_mem_from: 'First story unit', sa_mem_to: 'Last story unit, inclusive', sa_through: 'Mark archived through message' };
+        root.classList.add('sa-workspace'); if (this.w.h.settings().databaseOnly) root.classList.add('sa-database-workspace');
+        const labels = { sa_lorebook: this.w.h.settings().databaseOnly ? 'Evidence database' : 'Story archive lorebook', sa_newname: 'New archive name', sa_tr_sel: 'Tracker', sa_pl_sel: 'Archive prompt preset', sa_pl_name: 'Prompt name', sa_prompt: 'Archive prompt', sa_mem_prompt: 'Character memory prompt', sa_cond_prompt: 'Organize existing memories prompt', sa_mem_shorten_prompt: 'Shorten character memories prompt', sa_tr_prompt: 'Tracker prompt', sa_mem_from: 'First story unit', sa_mem_to: 'Last story unit, inclusive', sa_through: 'Mark archived through message' };
         for (const [id, label] of Object.entries(labels)) root.querySelector('#' + id)?.setAttribute('aria-label', label);
         const title = root.querySelector('.sa-title'), version = title.querySelector('.sa-ver')?.textContent || `v${VERSION}`;
-        title.innerHTML = `<div class="sa-brand"><span class="sa-brand-mark" aria-hidden="true">🗂️</span><div><span class="sa-eyebrow">YOUR STORY, KEPT TOGETHER</span><div class="sa-wordmark">Scene Archivist <span class="sa-ver">${h(version)}</span></div></div></div><div class="sa-header-actions"><button type="button" class="sa-toolbar-button" data-sa-ui="guide">🌱 Start here</button><button type="button" class="sa-toolbar-button" data-sa-ui="help">❔ Help & examples</button></div>`;
+        title.innerHTML = `<div class="sa-brand"><span class="sa-brand-mark" aria-hidden="true">🗂️</span><div><span class="sa-eyebrow">${this.w.h.settings().databaseOnly ? 'SOURCE-BACKED STORY DATABASE' : 'YOUR STORY, KEPT TOGETHER'}</span><div class="sa-wordmark">Scene Archivist <span class="sa-ver">${h(version)}</span></div></div></div><div class="sa-header-actions"><button type="button" class="sa-toolbar-button" data-sa-ui="guide">🌱 Start here</button><button type="button" class="sa-toolbar-button" data-sa-ui="help">❔ Help & examples</button></div>`;
         const nav = root.querySelector('.sa-tabs');
         const tools = document.createElement('details');
         tools.className = 'sa-tools-menu';
-        tools.innerHTML = `<summary>🔧 Tools</summary><div class="sa-tools-links"></div>
+        tools.innerHTML = `<summary>${this.w.h.settings().databaseOnly ? "Display options" : "🔧 Tools"}</summary><div class="sa-tools-links"></div>
             <label class="sa-explain-switch"><input type="checkbox" data-sa-ui="advanced"><span>Advanced controls</span></label>
             <label class="sa-explain-switch"><input type="checkbox" data-sa-ui="explain"><span>Show help buttons</span></label>`;
         nav.append(tools);
-        for (const [tab, metadata] of Object.entries(TAB_GUIDE)) {
+        for (const [tab, metadata] of Object.entries(this.tabGuide)) {
             const button = root.querySelector(`[data-sa-tab="${tab}"]`);
-            button.innerHTML = `<span aria-hidden="true">${metadata.icon}</span><span>${metadata.label}</span>`;
+            button.innerHTML = this.w.h.settings().databaseOnly ? `<span>${metadata.label}</span>` : `<span aria-hidden="true">${metadata.icon}</span><span>${metadata.label}</span>`;
             button.title = metadata.note;
-            if (['maintain', 'prompt', 'settings'].includes(tab)) {
+            if (!this.w.h.settings().databaseOnly && ['maintain', 'prompt', 'settings'].includes(tab)) {
                 button.removeAttribute('role');
                 button.tabIndex = 0;
                 tools.querySelector('.sa-tools-links').append(button);
             }
         }
+        if (this.w.h.settings().databaseOnly) nav.append(tools);
         const heading = document.createElement('header'); heading.className = 'sa-page-heading'; heading.id = 'sa-page-heading';
         root.querySelector('.sa-tabs').after(heading);
         const notice = document.createElement('p'); notice.id = 'sa-automation-notice'; notice.className = 'sa-automation-notice'; notice.hidden = true;
@@ -106,17 +118,29 @@ export class WorkspaceLayout {
         }
         this.arrangeActions();
         this.arrangeSections();
+        if (this.w.h.settings().databaseOnly) {
+            // Only strip decorative prefixes on static UI labels, never story data.
+            const clean = value => value.replace(/^[\s\p{Extended_Pictographic}\uFE0F\u200D]+/u, '');
+            for (const node of root.querySelectorAll('.sa-card > summary, .sa-inline-tools > summary, .sa-header-actions button, .sa-pane button[data-sa-action], .sa-pane input.menu_button, .sa-start-actions button')) {
+                if (node instanceof HTMLInputElement) node.value = clean(node.value);
+                else if (node.firstChild?.nodeType === 3) node.firstChild.textContent = clean(node.firstChild.textContent);
+            }
+            // The library and diary reader are daily tools; keep creation tasks folded.
+            const create = root.querySelector('[data-sa-section="character-create"]');
+            if (create) create.open = false;
+        }
         const welcome = document.createElement('section'); welcome.className = 'sa-start-banner'; welcome.setAttribute('aria-label', 'Getting started');
-        welcome.innerHTML = `<div><span class="sa-eyebrow">A LITTLE GUIDANCE</span><h3>Start with one scene.</h3><p>Pick messages. Review a summary. Create character memories.</p></div><div class="sa-start-actions"><button type="button" class="menu_button sa-primary" data-sa-action="firstArchive">🌱 Start here</button><button type="button" class="sa-toolbar-button" data-sa-ui="example">See a worked example</button></div>`;
+        welcome.innerHTML = this.w.h.settings().databaseOnly ? `<div><span class="sa-eyebrow">QUICK START</span><h3>Scan new messages. Retrieve only when needed.</h3><p>Use an exact range only when you deliberately want one specific part of the chat.</p></div><div class="sa-start-actions"><button type="button" class="menu_button sa-primary" data-sa-ui="overview">Go to Overview</button><button type="button" class="sa-toolbar-button" data-sa-ui="example">See a worked example</button></div>` : `<div><span class="sa-eyebrow">A LITTLE GUIDANCE</span><h3>Start with one scene.</h3><p>Pick messages. Review a summary. Create character memories.</p></div><div class="sa-start-actions"><button type="button" class="menu_button sa-primary" data-sa-action="firstArchive">🌱 Start here</button><button type="button" class="sa-toolbar-button" data-sa-ui="example">See a worked example</button></div>`;
         this.w.panes.archive.prepend(welcome);
         const libraryHint = document.createElement('div'); libraryHint.className = 'sa-selection-strip'; libraryHint.id = 'sa-selection-strip'; libraryHint.hidden = true;
-        libraryHint.innerHTML = '<span></span><button type="button" class="sa-text-button" data-sa-ui="condenseSelection">Condense selection →</button><button type="button" class="sa-text-button" data-sa-ui="selectionTools">Selected-record tools →</button>';
+        libraryHint.innerHTML = this.w.h.settings().databaseOnly ? '<span></span><button type="button" class="sa-text-button" data-sa-ui="condenseSelection">Recap / shorten selected →</button><button type="button" class="sa-text-button" data-sa-ui="selectionTools">Selected evidence tools →</button>' : '<span></span><button type="button" class="sa-text-button" data-sa-ui="condenseSelection">Condense selection →</button><button type="button" class="sa-text-button" data-sa-ui="selectionTools">Selected-record tools →</button>';
         this.w.panes.library.prepend(libraryHint);
         root.addEventListener('click', e => {
             const button = e.target.closest('[data-sa-ui]'); if (!button || button.matches('input')) return;
             const action = button.dataset.saUi;
             if (action === 'all') this.setMode('all');
-            else if (action === 'guide') void this.w.dispatch('firstArchive').catch(error => this.w.h.notify(error.message, 'error'));
+            else if (action === 'overview') this.w.showTab('story');
+            else if (action === 'guide') { const work = this.w.h.settings().databaseOnly ? this.showGuide('start') : this.w.dispatch('firstArchive'); void work.catch(error => this.w.h.notify(error.message, 'error')); }
             else if (action === 'help' || action === 'example') void this.showGuide(action === 'example' ? 'example' : 'start').catch(error => this.w.h.notify(error.message, 'error'));
             else if (action === 'condenseSelection') this.jump('condense-archive');
             else if (action === 'selectionTools') this.jump('library-selected');
@@ -161,6 +185,13 @@ export class WorkspaceLayout {
             extract: '🧩 Extract from selected records', newKnowledge: '💡 Add knowledge', newFact: '📌 Add a fact', newThread: '🧵 Add a promise or thread',
             selectVisible: '☑️ Select results', clearSelection: '🧽 Clear selection', clip: '✍️ Save a note',
         };
+        if (this.w.h.settings().databaseOnly) Object.assign(actionLabels, {
+            tidy: 'Normalize record order', condenseSelected: 'Review recap / shortening', condenseSuggested: 'Find recap candidates',
+            rangePreview: 'Preview selected messages', rangeArchive: 'Scan selected range', ask: 'Ask the database', refresh: 'Reload database',
+            continuity: 'Check this claim', continuityAll: 'Check recent continuity', continuityFull: 'Check whole database',
+            extract: 'Extract continuity from selected evidence', newKnowledge: 'Add character knowledge', newFact: 'Add story fact', newThread: 'Add open thread / promise',
+            selectVisible: 'Select all shown', clearSelection: 'Clear selected records', clip: 'Save evidence note',
+        });
         for (const [action, label] of Object.entries(actionLabels)) { const button = byAction(root, action); if (button) button.textContent = label; }
         for (const action of ['rangeArchive', 'memoriesAll', 'characterUpdate', 'ask', 'condenseSelected']) primary(byAction(root, action));
         primary(byAction(root, 'storyThorough'));
@@ -173,10 +204,12 @@ export class WorkspaceLayout {
         const history = document.createElement('div'); history.className = 'sa-row sa-history-row'; history.append(root.querySelector('#sa_undo')); hero.append(history);
         hero.querySelector('.sa-mini')?.remove();
         const browser = root.querySelector('[data-sa-section="character-browser"]');
-        const recovery = document.createElement('details'); recovery.className = 'sa-inline-tools'; recovery.dataset.saRecoveryTools = 'true';
-        recovery.innerHTML = '<summary>🧽 Reset & rebuild memories</summary><p class="sa-hint">For deliberate corrections and fresh extraction. Each action explains its scope before continuing.</p><div class="sa-row"></div>';
-        for (const action of ['clearCharacter', 'forceMemories', 'clearAllMemories']) recovery.lastElementChild.append(byAction(browser, action));
-        browser.querySelector('#sa-character-memories').before(recovery);
+        if (browser) {
+            const recovery = document.createElement('details'); recovery.className = 'sa-inline-tools'; recovery.dataset.saRecoveryTools = 'true';
+            recovery.innerHTML = '<summary>🧽 Reset & rebuild memories</summary><p class="sa-hint">For deliberate corrections and fresh extraction. Each action explains its scope before continuing.</p><div class="sa-row"></div>';
+            for (const action of ['clearCharacter', 'forceMemories', 'clearAllMemories']) { const node = byAction(browser, action); if (node) recovery.lastElementChild.append(node); }
+            browser.querySelector('#sa-character-memories')?.before(recovery);
+        }
         // Separate ordinary coverage from settings that change processing behavior.
         const ledger = root.querySelector('[data-sa-section="archive-ledger"] .sa-body');
         const ledgerTools = document.createElement('details'); ledgerTools.className = 'sa-inline-tools'; ledgerTools.innerHTML = '<summary>📒 Coverage & visibility settings</summary><div></div>';
@@ -187,11 +220,13 @@ export class WorkspaceLayout {
         const ledgerCard = ledger.closest('.sa-card'), tidyCard = root.querySelector('[data-sa-section="archive-tidy"]');
         if (tidyCard) tidyCard.before(ledgerCard);
         const range = root.querySelector('[data-sa-section="archive-range"] .sa-body');
-        range.querySelector('.sa-hint').textContent = 'Use the small book icon beside a chat message’s edit controls. Set Start on the first message and End on the last, or type both numbers below. Both ends are included.';
-        const visibility = document.createElement('details'); visibility.className = 'sa-inline-tools';
-        visibility.innerHTML = '<summary>👁️ Message visibility</summary><p class="sa-hint">Hide or show original messages in future chat context. Saved summaries and ledger coverage stay as they are.</p><div class="sa-row"></div>';
-        for (const action of ['rangeHide', 'rangeShow']) visibility.lastElementChild.append(byAction(range, action));
-        range.append(visibility);
+        if (!this.w.h.settings().databaseOnly) range.querySelector('.sa-hint').textContent = 'Use the small book icon beside a chat message’s edit controls. Set Start on the first message and End on the last, or type both numbers below. Both ends are included.';
+        if (!this.w.h.settings().databaseOnly) {
+            const visibility = document.createElement('details'); visibility.className = 'sa-inline-tools';
+            visibility.innerHTML = '<summary>👁️ Message visibility</summary><p class="sa-hint">Hide or show original messages in future chat context. Saved summaries and ledger coverage stay as they are.</p><div class="sa-row"></div>';
+            for (const action of ['rangeHide', 'rangeShow']) { const node = byAction(range, action); if (node) visibility.lastElementChild.append(node); }
+            range.append(visibility);
+        }
         const search = root.querySelector('[data-sa-section="search-answer"] .sa-row');
         const question = search.querySelector('[data-sa-field="question"]'); question.classList.add('sa-question');
         const askRow = document.createElement('div'); askRow.className = 'sa-row sa-question-row'; question.before(askRow); askRow.append(question, byAction(search, 'ask'));
@@ -242,7 +277,7 @@ export class WorkspaceLayout {
         this.help.refresh(this.w.panes[this.w.currentTab]);
     }
     select(tab) {
-        const metadata = TAB_GUIDE[tab] || TAB_GUIDE.story;
+        const metadata = this.tabGuide[tab] || this.tabGuide.story;
         const heading = this.root.querySelector('#sa-page-heading');
         heading.hidden = tab === 'story';
         heading.innerHTML = `<h2>${h(metadata.label)}</h2><p>${h(metadata.note)}</p>`;
@@ -259,7 +294,7 @@ export class WorkspaceLayout {
             if (![...archive.options].some(option => option.value === s.lorebook) && this.w.h.context().getWorldInfoNames().includes(s.lorebook)) archive.add(new Option(s.lorebook, s.lorebook));
             archive.value = s.lorebook;
         }
-        if (s.autoArchive) enabled.push('archiving at the configured reminder interval');
+        if (s.autoArchive && s.cadencePaused !== true && Number(s.remindEvery) > 0) enabled.push('archiving at the configured reminder interval');
         if (s.memoryAuto) enabled.push('character memories after archiving');
         if (s.trackerAuto) enabled.push('trackers after archiving');
         if (s.workbench?.autoCondense === 'auto') enabled.push('automatic recaps');
@@ -281,14 +316,19 @@ export class WorkspaceLayout {
         this.help.hide();
         const root = document.createElement('div'); root.className = 'sa-review sa-help-hub';
         const id = `sa-guide-${++this.guideNumber}`; let route = '';
-        root.innerHTML = `<div class="sa-guide-heading"><span class="sa-eyebrow">A FRIENDLIER FIRST CHAPTER</span><h3>🧭 A little help finding your way.</h3><p>You can learn the workflow here before changing a real story.</p></div><div class="sa-guide-tabs" role="tablist" aria-label="Help topics">${[['start', 'Start here'], ['buttons', 'Button guide'], ['example', 'Worked example']].map(([key, label]) => `<button type="button" role="tab" id="${id}-${key}" aria-controls="${id}-${key}-panel" data-help-page="${key}">${label}</button>`).join('')}</div><section id="${id}-start-panel" role="tabpanel" aria-labelledby="${id}-start" data-help-panel="start">${this.startPage()}</section><section id="${id}-buttons-panel" role="tabpanel" aria-labelledby="${id}-buttons" data-help-panel="buttons"><label class="sa-field"><span>Find a button by name or purpose</span><input class="text_pole" data-help-search placeholder="Try redo, memories, sources, undo…"></label><p class="sa-hint">Expand a button to see what it does, what changes and whether it uses AI.</p><div data-help-directory></div></section><section id="${id}-example-panel" role="tabpanel" aria-labelledby="${id}-example" data-help-panel="example">${this.examplePage()}</section>`;
+        root.innerHTML = `<div class="sa-guide-heading"><span class="sa-eyebrow">${this.w.h.settings().databaseOnly ? 'DATABASE GUIDE' : 'A FRIENDLIER FIRST CHAPTER'}</span><h3>🧭 ${this.w.h.settings().databaseOnly ? 'How Scene Archivist works.' : 'A little help finding your way.'}</h3><p>${this.w.h.settings().databaseOnly ? 'Scan evidence, verify sources, and retrieve continuity only when it is needed.' : 'You can learn the workflow here before changing a real story.'}</p></div><div class="sa-guide-tabs" role="tablist" aria-label="Help topics">${[['start', 'Start here'], ['buttons', 'Button guide'], ['example', 'Worked example']].map(([key, label]) => `<button type="button" role="tab" id="${id}-${key}" aria-controls="${id}-${key}-panel" data-help-page="${key}">${label}</button>`).join('')}</div><section id="${id}-start-panel" role="tabpanel" aria-labelledby="${id}-start" data-help-panel="start">${this.startPage()}</section><section id="${id}-buttons-panel" role="tabpanel" aria-labelledby="${id}-buttons" data-help-panel="buttons"><label class="sa-field"><span>Find a button by name or purpose</span><input class="text_pole" data-help-search placeholder="${this.w.h.settings().databaseOnly ? 'Try scan, evidence, sources, repair…' : 'Try redo, memories, sources, undo…'}"></label><p class="sa-hint">Expand a button to see what it does, what changes and whether it uses AI.</p><div data-help-directory></div></section><section id="${id}-example-panel" role="tabpanel" aria-labelledby="${id}-example" data-help-panel="example">${this.examplePage()}</section>`;
         const showPage = key => {
             for (const button of root.querySelectorAll('[data-help-page]')) { button.setAttribute('aria-selected', String(button.dataset.helpPage === key)); button.tabIndex = button.dataset.helpPage === key ? 0 : -1; }
             root.querySelectorAll('[data-help-panel]').forEach(panel => panel.hidden = panel.dataset.helpPanel !== key);
         };
         const directory = () => {
             const query = root.querySelector('[data-help-search]').value.trim().toLocaleLowerCase();
-            const entries = Object.entries(ACTION_HELP).filter(([, data]) => `${data.title} ${data.description} ${data.changes} ${data.example}`.toLocaleLowerCase().includes(query));
+            const entries = Object.entries(ACTION_HELP).filter(([key, data]) => {
+                if (!`${data.title} ${data.description} ${data.changes} ${data.example}`.toLocaleLowerCase().includes(query)) return false;
+                if (!this.w.h.settings().databaseOnly) return true;
+                const control = this.root.querySelector(`[data-sa-action="${key}"],#${key}`);
+                return !!control && !control.hidden && !control.closest('[hidden]');
+            });
             const unique = [...new Map(entries.map(([key, data]) => [data.title, [key, data]])).values()];
             root.querySelector('[data-help-directory]').innerHTML = `<p class="sa-hint">${unique.length} matching actions</p>` + unique.map(([, data]) => `<details class="sa-guide-action"><summary><b>${h(data.title)}</b><span class="sa-badge">${aiLabel(data.ai)}</span></summary>${helpHtml(data)}</details>`).join('');
         };
@@ -312,9 +352,12 @@ export class WorkspaceLayout {
         if (route) this.jump(route);
     }
     startPage() {
-        return `<div class="sa-guide-steps"><article><span>01</span><h4>Archive one scene</h4><p>Choose an inclusive message range in Archive, preview it and ask for a summary. Review the result before saving.</p></article><article><span>02</span><h4>Create character memories</h4><p>Open Characters and create memories from the saved summaries. Use chat, archive, or both. The lists keep dates and links to their evidence.</p></article><article><span>03</span><h4>Continue the story</h4><p>Native World Info loads eligible entries into replies. Prompt shows the recorded keyword, vector and other activation reasons.</p></article></div><div class="sa-row"><button type="button" class="menu_button sa-primary" data-help-go="setup">🌱 Open guided setup</button><button type="button" class="menu_button" data-help-go="archive-range">Take me to message ranges</button></div><h4>Where does everything live?</h4><div class="sa-guide-map">${Object.entries(TAB_GUIDE).map(([, data]) => `<p><b>${data.icon} ${h(data.label)}</b><span>${h(data.note)}</span></p>`).join('')}</div><p class="sa-note">Open Tools for Maintain, Prompt and Settings. Advanced controls reveals more sections without changing automation. Hover or focus a control for help, or enable Show help buttons for a tap target.</p>`;
+        if (this.w.h.settings().databaseOnly) return `<div class="sa-guide-steps"><article><span>01</span><h4>Scan new story messages</h4><p>Overview → Scan all new messages processes everything Scene Archivist has not scanned yet. Large chats are split automatically.</p></article><article><span>02</span><h4>Use an exact range only when you mean it</h4><p>Scan → choose Start and End when you want one scene, one old arc, a corrected section, or a small test sample.</p></article><article><span>03</span><h4>Retrieve instead of inject</h4><p>The database stays out of normal RP prompts. The main model can search evidence, open verified source messages, or open a known archive unit when continuity actually requires it.</p></article></div><div class="sa-row"><button type="button" class="menu_button sa-primary" data-help-go="archive-range">Choose a message range</button><button type="button" class="menu_button" data-help-go="library-records">Browse evidence</button></div><h4>Where does everything live?</h4><div class="sa-guide-map">${Object.entries(this.tabGuide).map(([, data]) => `<p><b>${data.icon} ${h(data.label)}</b><span>${h(data.note)}</span></p>`).join('')}</div><p class="sa-note">For ordinary use: scan new messages, then leave Scene Archivist alone until the model needs old evidence. Nothing is ambiently injected.</p>`;
+        return `<div class="sa-guide-steps"><article><span>01</span><h4>Archive one scene</h4><p>Choose an inclusive message range in Archive, preview it and ask for a summary. Review the result before saving.</p></article><article><span>02</span><h4>Create character memories</h4><p>Open Characters and create memories from the saved summaries. Use chat, archive, or both. The lists keep dates and links to their evidence.</p></article><article><span>03</span><h4>Continue the story</h4><p>Native World Info loads eligible entries into replies. Prompt shows the recorded keyword, vector and other activation reasons.</p></article></div><div class="sa-row"><button type="button" class="menu_button sa-primary" data-help-go="setup">🌱 Open guided setup</button><button type="button" class="menu_button" data-help-go="archive-range">Take me to message ranges</button></div><h4>Where does everything live?</h4><div class="sa-guide-map">${Object.entries(this.tabGuide).map(([, data]) => `<p><b>${data.icon} ${h(data.label)}</b><span>${h(data.note)}</span></p>`).join('')}</div><p class="sa-note">Open Tools for Maintain, Prompt and Settings. Advanced controls reveals more sections without changing automation. Hover or focus a control for help, or enable Show help buttons for a tap target.</p>`;
     }
     examplePage() {
-        return `<p class="sa-example-notice"><b>Read-only sample.</b> These invented examples make no AI requests and do not write to your chats or lorebooks.</p><div class="sa-example-steps" role="group" aria-label="Example stages">${[['chat', '1 · Chat'], ['archive', '2 · Summary'], ['memory', '3 · Memory'], ['loading', '4 · Loading']].map(([key, label]) => `<button type="button" data-example-step="${key}" aria-pressed="${key === 'chat'}">${label}</button>`).join('')}</div><div class="sa-example-stage" data-example-panel="chat"><span class="sa-eyebrow">TUESDAY, OCTOBER 6, 2026 · MESSAGES 12 TO 13</span><h4>A small scene, before it becomes history.</h4><div class="sa-example-message"><b>Mara · #12</b><p>Keep the blue key. Meet me at Ember Station at eight.</p></div><div class="sa-example-message"><b>Rowan · #13</b><p>I have it. Eight at the station, I’ll be there.</p></div><p>Choose 12 to 13 and Preview range. Both messages are included. Summarize this range sends them to your model.</p></div><div class="sa-example-stage" data-example-panel="archive" hidden><span class="sa-eyebrow">ARCHIVE · A REVIEWED SUMMARY</span><h4>Day 1 · Tuesday, October 6, 2026</h4><p class="sa-example-record">Mara gave Rowan the blue key. Rowan agreed to meet her at Ember Station at 8 PM.</p><p>The source link points back to messages 12 to 13. A ledger marker records that this range was archived.</p><p><b>What to check:</b> They agreed to meet. The messages do not prove the meeting already happened.</p></div><div class="sa-example-stage" data-example-panel="memory" hidden><span class="sa-eyebrow">CHARACTERS · ROWAN</span><h4>A memory belongs to someone.</h4><p class="sa-example-record">[Tuesday, October 6, 2026 · Day 1]<br>Received Mara’s blue key and agreed to meet her at Ember Station at 8 PM.</p><p>Create character memories can read chat, archive units, or both. Each memory keeps a link to its source.</p><p><b>What to check:</b> Rowan knows about the arrangement. Another character does not automatically learn it.</p></div><div class="sa-example-stage" data-example-panel="loading" hidden><span class="sa-eyebrow">ILLUSTRATED LOADING EXAMPLES, NOT A LIVE SCAN</span><h4>Two independent ways a record can be found.</h4><article class="sa-example-channel"><b>🔑 Native keyword</b><p>If this entry’s keyword is “blue key”, a matching message can activate it under your World Info rules.</p></article><article class="sa-example-channel"><b>🧭 Native vector</b><p>A configured semantic search might find the handover when the conversation refers to the station key, if its similarity settings accept that result.</p></article><p>Each mechanism follows its own settings. A word in an entry’s body does not make its vector result a keyword match. Prompt → Memory budget and loading reasons shows the evidence available for a real reply.</p></div>`;
+        if (this.w.h.settings().databaseOnly) return `<p class="sa-example-notice"><b>Read-only example.</b> This makes no AI requests and writes nothing.</p><div class="sa-example-steps" role="group" aria-label="Example stages">${[['chat', '1 · Chat'], ['scan', '2 · Evidence'], ['retrieve', '3 · Retrieval']].map(([key, label]) => `<button type="button" data-example-step="${key}" aria-pressed="${key === 'chat'}">${label}</button>`).join('')}</div><div class="sa-example-stage" data-example-panel="chat"><span class="sa-eyebrow">MESSAGES 12–13</span><h4>A scene exists in chat first.</h4><div class="sa-example-message"><b>Mara · #12</b><p>Keep the blue key. Meet me at Ember Station at eight.</p></div><div class="sa-example-message"><b>Rowan · #13</b><p>I have it. Eight at the station, I’ll be there.</p></div><p>Normal catch-up uses Scan all new messages. Use an exact range only when you specifically want messages 12–13 and not the rest of the pending chat.</p></div><div class="sa-example-stage" data-example-panel="scan" hidden><span class="sa-eyebrow">DATABASE · SOURCE-BACKED EVIDENCE</span><h4>Scene 1</h4><p class="sa-example-record">Mara gave Rowan the blue key. Rowan agreed to meet her at Ember Station at 8 PM.</p><p>The record keeps provenance back to messages 12–13. Structured extraction can separately record the promise and Rowan’s knowledge state.</p></div><div class="sa-example-stage" data-example-panel="retrieve" hidden><span class="sa-eyebrow">ON-DEMAND TOOL LOOKUP</span><h4>The model asks only when it needs old continuity.</h4><p class="sa-example-record">Search evidence → finds the blue-key promise → Open source if exact wording or attribution matters.</p><p>No Scene Archivist record is placed into ordinary RP context merely because it exists.</p></div>`;
+        return `<p class="sa-example-notice"><b>Read-only sample.</b> These invented examples make no AI requests and do not write to your chats or lorebooks.</p><div class="sa-example-steps" role="group" aria-label="Example stages">${[['chat', '1 · Chat'], ['archive', '2 · Summary'], ['memory', '3 · Memory'], ['loading', '4 · Loading']].map(([key, label]) => `<button type="button" data-example-step="${key}" aria-pressed="${key === 'chat'}">${label}</button>`).join('')}</div><div class="sa-example-stage" data-example-panel="chat"><span class="sa-eyebrow">TUESDAY, OCTOBER 6, 2026 · MESSAGES 12 TO 13</span><h4>A small scene, before it becomes history.</h4><div class="sa-example-message"><b>Mara · #12</b><p>Keep the blue key. Meet me at Ember Station at eight.</p></div><div class="sa-example-message"><b>Rowan · #13</b><p>I have it. Eight at the station, I’ll be there.</p></div><p>Choose 12 to 13 and Preview range. Both messages are included. Summarize this range sends them to your model.</p></div><div class="sa-example-stage" data-example-panel="archive" hidden><span class="sa-eyebrow">ARCHIVE · A REVIEWED SUMMARY</span><h4>Day 1 · Tuesday, October 6, 2026</h4><p class="sa-example-record">Mara gave Rowan the blue key. Rowan agreed to meet her at Ember Station at 8 PM.</p></div><div class="sa-example-stage" data-example-panel="memory" hidden><span class="sa-eyebrow">CHARACTERS · ROWAN</span><h4>A memory belongs to someone.</h4><p class="sa-example-record">[Tuesday, October 6, 2026 · Day 1]<br>Received Mara’s blue key and agreed to meet her at Ember Station at 8 PM.</p></div><div class="sa-example-stage" data-example-panel="loading" hidden><span class="sa-eyebrow">ILLUSTRATED LOADING EXAMPLES</span><h4>Keyword and vector lookup are independent.</h4></div>`;
     }
+
 }

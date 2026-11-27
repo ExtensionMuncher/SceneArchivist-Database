@@ -10,7 +10,7 @@ const option = (v, label) => `<option value="${h(v)}">${h(label)}</option>`;
 
 export function mountTools(w) {
     w.panes.library.querySelector('#sa-library-query').closest('.sa-row').insertAdjacentHTML('afterend', `<details class="sa-library-filters"><summary>🔎 More filters</summary><div class="sa-grid">
-        <label class="sa-field"><span>Character</span><select class="text_pole sa-library-filter" id="sa-library-subject"></select></label>
+        <label class="sa-field"><span>Subject / entity</span><select class="text_pole sa-library-filter" id="sa-library-subject"></select></label>
         <label class="sa-field"><span>Source chat</span><select class="text_pole sa-library-filter" id="sa-library-chat"></select></label>
         <label class="sa-field"><span>First unit</span><input class="text_pole sa-library-filter" type="number" min="0" id="sa-library-from"></label>
         <label class="sa-field"><span>Last unit</span><input class="text_pole sa-library-filter" type="number" min="0" id="sa-library-to"></label>
@@ -38,12 +38,13 @@ export function renderTools(w) {
     if (!w.root) return;
     const subjects = M.unique(w.entries.flatMap(e => [M.record(e)?.subject, ...(M.record(e)?.aliases || [])])).sort((a,b)=>a.localeCompare(b));
     const chats = [...new Map(w.entries.filter(T.sourceChat).map(e => [T.sourceChat(e), T.sourceLabel(e)])).entries()];
-    fill(w.root.querySelector('#sa-library-subject'), subjects.map(n=>[n,n]), option('','All characters'));
+    fill(w.root.querySelector('#sa-library-subject'), subjects.map(n=>[n,n]), option('','All subjects'));
     fill(w.root.querySelector('#sa-library-chat'), chats, option('','All source chats')+option('unknown','Legacy / unknown chat'));
-    fill(w.root.querySelector('[data-sa-field=knowledgeSubject]'), subjects.map(n=>[n,n]), option('','Choose a character'));
+    const characters = w.diaryRoster().map(c=>c.name);
+    fill(w.root.querySelector('[data-sa-field=knowledgeSubject]'), characters.map(n=>[n,n]), option('','Choose a character'));
     fill(w.root.querySelector('[data-sa-field=rosterBook]'), Object.keys(w.books).map(n=>[n,n]));
     const roster = w.root.querySelector('#sa-roster-list');
-    if (roster) roster.textContent = subjects.length ? subjects.join(' · ') : 'No named character records yet.';
+    if (roster) roster.textContent = characters.length ? characters.join(' · ') : 'No named character records yet.';
     const activity = w.root.querySelector('#sa-activity-list'); if (!activity) return;
     const journals = (w.h.meta().journals || []).filter(j=>j.archive===w.h.settings().lorebook);
     const rows = journals.map(j=>({id:j.id,label:j.label,at:j.updated||j.at,chat:j.chatId,status:j.status,count:j.changes.length}));
@@ -118,7 +119,8 @@ async function repair(w, selectedOnly) {
 async function knowledge(w) {
     await w.refresh();
     const subject=w.value('knowledgeSubject');if(!subject)throw new Error('Choose a character.');
-    const result=T.knowledgeAt(w.entries,subject,w.value('knowledgeDate')),box=w.root.querySelector('#sa-knowledge-results');
+    const person=w.diaryRoster().find(c=>c.name===subject);
+    const result=T.knowledgeAt(w.entries,person?[person.name,...person.aliases]:subject,w.value('knowledgeDate')),box=w.root.querySelector('#sa-knowledge-results');
     box.innerHTML=`<h4>Recorded knowledge by ${h(result.cutoff)}</h4>`+result.known.map(({entry,version})=>`<article class="sa-result"><b>${h(version.knowledge||'memory')}</b> · ${version.knowledge==='unaware'?'state dated':'learned'} ${h(version.learned)}<div class="sa-prose">${h(version.content)}</div>${button('inspect','Inspect current record',`data-id="${h(M.record(entry).id)}"`)}</article>`).join('')+(result.known.length?'':'<p>No dated learning record proves knowledge by this date.</p>')+`<details><summary>${result.unknown.length} records with unknown or unverified learning dates</summary><p class="sa-hint">These are not included in the dated knowledge above.</p>${result.unknown.map(e=>`<p>${h(M.title(e))} ${button('inspect','Set learning date in Inspect',`data-id="${h(M.record(e).id)}"`)}</p>`).join('')}</details>`;
 }
 

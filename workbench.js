@@ -30,6 +30,18 @@ import { memoryEvidence, mergeMemoryEvidence, memoryRewriteSources, memoryRewrit
 import { chooseWorkflow, showForgotten, showDiagnostics } from './release-tools.js';
 import { checkGrounding } from './quality-check.js';
 import { outputLimitReached } from './model-routing.js';
+import * as Debug from './debug-log.js';
+import * as Cast from './diary-cast.js';
+import * as Character from './character-evidence.js';
+import * as StoryContext from './story-context.js';
+import * as ScannedAuthors from './scanned-authors.js';
+import * as DiaryPolicy from './diary-policy.js';
+import { markdownPreview, recordPreview } from './markdown-preview.js';
+import * as Vectors from './archive-vectors.js';
+import * as Rerank from './archive-reranker.js';
+import * as Tree from './information-tree.js';
+import * as Extract from './extraction-batches.js';
+import { isRateLimit, errorDetails } from './rate-limiter.js';
 
 const listValue = value => M.unique(String(value || '').split(/\s*;\s*/));
 const flat = (it, unit) => it.a == null ? it.text : `[${it.b != null && it.b !== it.a ? unit + 's ' + it.a + '-' + it.b : unit + ' ' + it.a}${it.date ? ', ' + it.date : ''}] ${it.text}`;
@@ -40,9 +52,11 @@ const canRecoverRecapJSON = (job, step) => job?.kind === 'condense' && job.optio
     (step.condenseRaw || step.error === recapJSONError || step.error === 'No usable condensation JSON was returned.');
 
 export const WORKBENCH_DEFAULTS = {
+    ...Rerank.RERANK_DEFAULTS,
+    archiveVectorMode: 'keyword', archiveVectorSource: 'ollama', archiveVectorModel: '', archiveVectorUrl: 'http://127.0.0.1:11434', archiveVectorK: 8, archiveVectorThreshold: 0.25, ensembleTools: false,
     budget: 6000, requestBudget: 0, modelAwareRequests: true, preciseDelivery: false, auditCondense: false, autoCondense: 'off', trigger: 'units', afterUnits: 10,
     afterDays: 30, pressureTokens: 16000, batchSize: 0, charactersPerBatch: 0, reviewMode: 'end', recapLabel: 'Arc', recapMode: 'recap',
-    continuityRecent: 20, branchMode: 'prune', continuityAuto: false, recapOnReturn: false, recapAfterHours: 24, semantic: false, requestLimit: 0, jobPreview: false, groupMemoryScope: true, messageBadges: 'desktop', memoryTools: false, cacheLayers: false, sceneRecall: true,
+    continuityRecent: 20, branchMode: 'prune', continuityAuto: false, recapOnReturn: false, recapAfterHours: 24, semantic: false, requestLimit: 0, jobPreview: false, groupMemoryScope: true, memoryTools: true, cacheLayers: false, sceneRecall: true,
 };
 
 export class Workbench {
@@ -63,6 +77,7 @@ export class Workbench {
         this.queue = new M.JobQueue({ state: () => this.liveState(), persist: () => this.persist(),
             perform: (j, s) => this.inBulk(j, () => this.perform(j, s)),
             commit: (j, s) => this.inBulk(j, () => this.commitStep(j, s)),
+            prepare: (j, s) => (s.payload.kind || j.kind) === 'extract' ? this.inBulk(j, () => this.prepareExtractionStage(j, s)) : false,
             extend: j => this.extendBulk(j), finish: j => new BulkRun(this, j).finish(), notify: () => this.renderJob() });
     }
 
@@ -96,6 +111,7 @@ export class Workbench {
     async persist() { this.baseHost.assert(); await this.baseHost.saveMeta(); }
     async recoverInterruptedJob() {
         const job = this.liveState().job;
+        if (this.queue.running && job?.status !== 'running') throw new Error('The job stopped before the next model request.');
         if (job?.status !== 'running' || this.queue.running || this.baseHost.isBusy()) return;
         job.error = job.phase === 'saving' || job.approval
             ? 'Saving was interrupted. Resume or review to finish the approved changes.'
@@ -108,20 +124,22 @@ export class Workbench {
         try { await this.ensureBranch(); return await fn(); } finally { this.h.end(); }
     }
     async call(req, label, archiveRange = null, transport = null) {
+        this.h.requireStandalone?.();
         this.h.assert();
-        const profile = transport?.profile ?? (this.h.settings().sideProfile || '');
+        const profile = transport?.profile ?? (this.liveState().job?.options?.profile ?? (this.h.settings().sideProfile || ''));
         const model = archiveRange ? null : this.h.flowModelInfo?.(profile);
         const job = this.liveState().job;
         if (job?.status === 'running' && job.options.requestLimit > 0 && (job.requestsThisResume || 0) >= job.options.requestLimit) {
             job.status = 'paused'; job.error = `Paused at the ${job.options.requestLimit}-request limit. Resume allows another ${job.options.requestLimit} requests.`; await this.persist(); throw new Error(job.error);
         }
+        if(!archiveRange){const context=StoryContext.settingBlock(this.storyContext());if(context)req={...req,system:(req.system||'')+context};}
         const text = (req.system || '') + '\n' + (req.prompt || '');
         const cost = Number(await this.h.tokenCount?.(text)) || M.tokens(text);
         const capacity = archiveRange ? null : this.helperCapacity(req.maxTokens || 1200, model);
         if (capacity && cost > capacity.input) throw new Error(`${label} needs about ${cost} input tokens. This connection has room for ${capacity.input} with the reply reserved. Choose less material or a larger context, or check your helper input limit.`);
         const st = this.liveState(), meter = (st.telemetry ??= { requests: 0, input: 0, output: 0 });
         meter.requests++; meter.input += cost; meter.last = { label,
-            ...(!archiveRange ? { profile, model: model?.name || (profile || 'Current SillyTavern model') } : {}),
+            ...(!archiveRange ? { profile, model: model?.model || model?.name || (profile || 'Current SillyTavern model'), provider: model?.provider || '' } : {}),
             at: M.now(), input: cost, state: 'requesting' };
         await this.persist();
         try {
@@ -134,7 +152,15 @@ export class Workbench {
             if (typeof raw !== 'string' || !raw.trim()) throw new Error('The model returned no text. A normal finish_reason of stop only means generation ended; empty or incomplete content is not accepted.');
             meter.output += M.tokens(raw); meter.last.state = 'received'; meter.last.output = M.tokens(raw);
             await this.persist(); return raw;
-        } catch (e) { meter.last.state = 'failed'; meter.last.error = String(e?.message ?? e); await this.persist(); throw e; }
+        } catch (e) {
+            if (e?.unsent || e?.cause?.unsent) { meter.requests--; meter.input -= cost; if (job && this.queue.running) { job.requestsThisResume = Math.max(0, (job.requestsThisResume || 0) - 1); job.requestsTotal = Math.max(0, (job.requestsTotal || 0) - 1); } }
+            meter.last.state = 'failed'; meter.last.error = String(e?.message ?? e);
+            Debug.error('MODEL_REQUEST_FAILED', `${label} failed.`, {
+                message: e?.message ?? String(e), profile: meter.last.profile || profile || 'current', model: meter.last.model || model?.name || '',
+                inputTokens: cost, maxOutputTokens: capacity?.output, provider: model?.provider || '', causes: errorDetails(e), job: job?.kind || '', step: job?.cursor ?? null,
+            });
+            await this.persist(); throw e;
+        }
     }
     async json(req, validate, label) {
         const raw = await this.call(req, label);
@@ -330,7 +356,7 @@ export class Workbench {
     showTab(tab) {
         if (!this.panes[tab]) return;
         this.currentTab = tab;
-        const inTools = ['maintain', 'prompt', 'settings'].includes(tab);
+        const inTools = !!this.root.querySelector(`[data-sa-tab="${tab}"]`)?.closest('.sa-tools-menu');
         for (const [id, pane] of Object.entries(this.panes)) {
             pane.hidden = id !== tab;
             const b = this.root.querySelector(`[data-sa-tab="${id}"]`);
@@ -355,12 +381,37 @@ export class Workbench {
             el.title = Core.unitize(el.dataset.unitTitle, unit);
         }
     }
+    async openInformationTree() {
+        const identity=this.identity(), archive=this.h.settings().lorebook;
+        await this.loadBooks();
+        if(identity!==this.identity()||archive!==this.h.settings().lorebook)throw new Error('Story changed. Reopen the tree.');
+        const roster=this.diaryRoster(),tree=Tree.buildTree([...this.entries,...this.littleThings().map(note=>Vectors.archiveNoteEntry(note,this.state().storyId))],n=>Cast.matchingCharacter(roster,n)?.name||'');
+        const root=document.createElement('div');root.className='sa-review sa-information-tree';
+        let branch='',page=1,query='';
+        const text=(tag,value)=>{const el=document.createElement(tag);el.textContent=value;return el;};
+        const control=(label,fn)=>{const b=text('button',label);b.type='button';b.className='menu_button';b.addEventListener('click',fn);return b;};
+        const current=()=>identity===this.identity()&&archive===this.h.settings().lorebook;
+        function draw(){
+            root.replaceChildren();if(!current()){root.append(text('p','Story changed. Close and reopen the tree.'));return;}
+            const view=Tree.browseTree(tree,branch,page,18,query);root.append(text('h3','Archive information tree'),text('p',`${view.label} · ${view.totalRecords} distinct records · page ${view.page}/${view.pages}`));
+            const nav=document.createElement('div');nav.className='sa-row';nav.append(control('Root',()=>{branch='';page=1;query='';draw();}));
+            if(branch)nav.append(control('Parent folder',()=>{branch=branch.split('/').slice(0,-1).join('/');page=1;query='';draw();}));
+            if(view.page>1)nav.append(control('Previous',()=>{page--;draw();}));if(view.page<view.pages)nav.append(control('Next',()=>{page++;draw();}));root.append(nav);const search=document.createElement('div');search.className='sa-row';const input=document.createElement('input');input.type='search';input.className='text_pole';input.placeholder='Search folder labels and summaries';input.value=query;const run=()=>{query=input.value;page=1;draw();};input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});search.append(input,control('Find',run));root.append(search);if(query)root.append(text('p',`${view.matchedRows} matching folders or records`));
+            for(const row of view.rows){const item=document.createElement('div');item.className='sa-tree-item';if(row.kind==='folder'){item.append(control(`📁 ${row.label} (${row.count})`,()=>{branch=row.id;page=1;query='';draw();}));}
+                else{item.append(control(row.label,()=>{if(!current()){draw();return;}const d=tree.records.get(row.id);const body=document.createElement('div');body.className='sa-markdown';body.innerHTML=markdownPreview(d.entry.content);root.replaceChildren(control('Back to folder',draw),text('h3',d.title),text('p',`Record ID: ${d.id}`),body);}),text('p',row.summary));}root.append(item);}
+            root.append(text('p','Navigation only. The original source-backed records remain authoritative.'));
+        }
+        draw();return this.h.show(root,{okButton:'Close',wide:true,large:true});
+    }
     async refresh() {
         if (this.loading) return;
         if (!this.h.begin()) return;
         this.loading = true;
         try {
-            if (this.h.settings().lorebook) { await this.ensureBranch(); await this.indexBooks(); }
+            // Passive refresh/open is strictly read-only. Branch detachment and
+            // record indexing are write preparation and happen inside withLock()
+            // when the user actually starts a Scene Archivist write operation.
+            if (this.h.settings().lorebook) await this.loadBooks();
             else { this.entries = []; this.books = {}; }
             await this.render();
             await this.h.refreshInfo?.();
@@ -374,28 +425,180 @@ export class Workbench {
         renderRecovery(this); this.renderDashboard(); this.renderLibrary(); this.renderJob(); this.renderBudget(); this.renderSharing();
         this.extras?.render();
         this.chatControls?.mount();
-        const candidates = M.condensationCandidates(this.entries, this.options());
-        this.root.querySelector('#sa-condense-suggestion').textContent = `${candidates.length} unprotected older entries meet the current trigger.`;
+        this.renderRecapSchedule();
         this.recapSuggestions.render();
         this.fillDiarySelects();
-        const meter = this.state().telemetry || {};
-        this.root.querySelector('#sa-telemetry').textContent = `${meter.requests || 0} workbench requests in this chat; about ${meter.input || 0} input and ${meter.output || 0} output tokens. Token figures are estimates; the injection budget uses the host tokenizer.`;
+        const meter = this.state().telemetry || {}, telemetry = this.root.querySelector('#sa-telemetry');
+        if (telemetry) telemetry.textContent = `${meter.requests || 0} workbench requests in this chat; about ${meter.input || 0} input and ${meter.output || 0} output tokens. ${this.h.settings().databaseOnly ? 'Token figures are estimates.' : 'Token figures are estimates; the injection budget uses the host tokenizer.'}`;
         const state = this.entries.filter(e => ['knowledge', 'fact', 'thread'].includes(M.record(e)?.type));
-        this.root.querySelector('#sa-state-list').innerHTML = state.slice(0, 100).map(e => `<div class="sa-result"><b>${html(M.record(e).subject || M.title(e))}</b> <span class="sa-badge">${html(M.record(e).type)}</span><p>${html(M.record(e).body || String(e.content).slice(0, 220))}</p>${button('inspect', 'Inspect', `data-id="${html(M.record(e).id)}"`)}${M.record(e).type === 'thread' && M.active(e) ? button('pinThread', M.record(e).protection?.pinned ? '📌 Unpin thread' : '📌 Pin for this story', `data-id="${html(M.record(e).id)}"`) : ''}</div>`).join('') || '<p class="sa-hint">No structured records yet.</p>';
+        this.root.querySelector('#sa-state-list').innerHTML = state.slice(0, 100).map(e => `<div class="sa-result"><b>${html(M.record(e).subject || M.title(e))}</b> <span class="sa-badge">${html(M.record(e).type)}</span><div class="sa-markdown sa-record-preview">${recordPreview(M.record(e).body || e.content, 500)}</div>${button('inspect', 'Inspect', `data-id="${html(M.record(e).id)}"`)}${!this.h.settings().databaseOnly && M.record(e).type === 'thread' && M.active(e) ? button('pinThread', M.record(e).protection?.pinned ? '📌 Unpin thread' : '📌 Pin for this story', `data-id="${html(M.record(e).id)}"`) : ''}</div>`).join('') || '<p class="sa-hint">No structured records yet.</p>';
     }
-    fillDiarySelects() {
-        const q = k => this.root.querySelector(`[data-sa-field=${k}]`);
-        const sel = q('diaryCharacter'), prev = sel.value;
-        const story = M.unique(this.entries.filter(e => ['memory', 'diary'].includes(M.record(e)?.type) && M.active(e)).map(e => M.record(e).subject || Core.classifyEntry(e)?.name).filter(Boolean));
-        const cards = (this.h.context().characters || []).map((c, i) => ({ i, name: c.name || c.data?.name || 'Character ' + i })).filter(c => !story.some(n => n.toLocaleLowerCase() === c.name.toLocaleLowerCase()));
-        sel.innerHTML = (story.length ? `<optgroup label="Characters with saved memories or diaries">${story.map(n => `<option value="m:${html(n)}">${html(n)}</option>`).join('')}</optgroup>` : '') + (cards.length ? `<optgroup label="Other character cards">${cards.map(c => `<option value="c:${c.i}">${html(c.name)}</option>`).join('')}</optgroup>` : '');
-        if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+    diaryScope() { return Cast.rosterScope(this.h.context(), this.h.settings().lorebook); }
+    diaryRoster() {
+        return Cast.diaryRoster(this.entries, this.state().diaryCast, this.h.context().chat || [], this.diaryScope());
+    }
+    fillDiarySelects(preferred = '') {
+        const q = k => this.root?.querySelector(`[data-sa-field=${k}]`);
+        const sel = q('diaryCharacter'); if (!sel) return;
+        const scope = this.diaryScope(), changed = this.diarySelectionScope !== scope;
+        const prev = preferred || (changed ? '' : sel.value);
+        if (changed) { for (const key of ['diaryName', 'diaryFrom', 'diaryTo', 'diaryDate']) if (q(key)) q(key).value = ''; this.diarySelectionScope = scope; }
+        const roster = this.diaryRoster();
+        const groups = [['saved','Saved memories or diaries'], ['archive','Archived story cast'], ['detected','Detected in chat'], ['manual','Manually added']];
+        sel.innerHTML = '<option value="">Choose a story character</option>' + groups.map(([kind,label]) => {
+            const names = roster.filter(c => c.kind === kind);
+            return names.length ? `<optgroup label="${label}">${names.map(c => `<option value="${html(c.name)}">${html(c.name)}</option>`).join('')}</optgroup>` : '';
+        }).join('');
+        const match = roster.find(c => Cast.nameKey(c.name) === Cast.nameKey(prev));
+        if (match) sel.value = match.name;
+        const status = this.root.querySelector('#sa-diary-cast-status');
+        if (status && !this.detectingDiaryCast) status.textContent = `${roster.length} individual story character${roster.length === 1 ? '' : 's'} available. No character card required.`;
+        this.renderDiaryReader();
+    }
+    diaryPolicyRoster() {
+        // Roster hiding is separate from diary eligibility, including typed aliases.
+        const stored=this.state().diaryCast;
+        return Cast.diaryRoster(this.entries,stored?{...stored,excluded:[]}:stored,this.h.context().chat||[],this.diaryScope());
+    }
+    storyContext() { return StoryContext.storyContext(this.liveState(),this.h.settings?.()?.lorebook||''); }
+    diaryStoryContext(roster=this.diaryPolicyRoster()) { return ScannedAuthors.withScannedAuthors(this.storyContext(),this.entries,roster); }
+    diaryIdentity(name) { const roster=this.diaryPolicyRoster();return StoryContext.authorBackground(this.h.context(),roster,name,this.diaryStoryContext(roster)); }
+    renderStoryContext(name='') {
+        const roster=this.diaryPolicyRoster(),context=this.diaryStoryContext(roster),scope=this.identity()+'|'+context.archive;
+        const setting=this.root?.querySelector('[data-sa-field="storySettingContext"]');
+        if(setting&&setting.dataset.contextScope!==scope){setting.value=context.setting;setting.dataset.contextScope=scope;}
+        const author=this.root?.querySelector('[data-sa-field="diaryAuthorIdentity"]');
+        const key=scope+'|'+Cast.nameKey(name);
+        if(author){const note=name?StoryContext.authorNote(context,roster,name):'';if(author.dataset.contextScope!==key||author.value===author.dataset.savedValue){author.value=note;author.dataset.contextScope=key;author.dataset.savedValue=note;}}
+        if(author)author.disabled=!name;
+    }
+    async saveStoryContext(author=false) {
+        const context=this.storyContext(), origin=this.identity(), name=(this.value('diaryName').trim()||this.value('diaryCharacter').trim());
+        if(!context.archive)throw new Error('Choose a story database first.');
+        const value=this.value(author?'diaryAuthorIdentity':'storySettingContext').trim();
+        if(value.length>(author?1500:4000))throw new Error('Context exceeds its character limit.');
+        if(author&&!Cast.usableName(name))throw new Error('Choose an individual diary author first.');
+        return this.withLock(async()=>{
+            if(this.identity()!==origin||this.h.settings().lorebook!==context.archive)throw new Error('Story changed. Reopen the context controls.');
+            if(author){const roster=this.diaryPolicyRoster(),canonical=StoryContext.authorName(roster,name);context.authors=context.authors.filter(x=>!DiaryPolicy.sameIdentity(roster,x.name,canonical));if(value)context.authors.push({name:canonical,text:value});}
+            else context.setting=value;
+            StoryContext.saveStoryContext(this.liveState(),context);await this.persist();if(author){const field=this.root?.querySelector('[data-sa-field="diaryAuthorIdentity"]');if(field){delete field.dataset.contextScope;this.renderStoryContext(name);}}this.h.notify(author?'Diary author identity saved.':'Story setting saved.','success');
+        });
+    }
+    diaryPolicy() { return DiaryPolicy.policyFor(this.liveState(),this.h.settings().lorebook||''); }
+    diaryExclusion(name) { return DiaryPolicy.exclusion(this.diaryPolicy(),this.diaryPolicyRoster(),this.h.context().name1||'',name); }
+    assertDiaryAllowed(name) {
+        const reason=this.diaryExclusion(name);
+        if(reason)throw new Error(`${name} is excluded from diary generation (${reason}). Allow this character in the diary blacklist first.`);
+    }
+    assertDiaryJob(job) {
+        if(job.kind==='diary')for(const step of job.steps||[])if(step.payload?.name)this.assertDiaryAllowed(step.payload.name);
+        if(job.kind==='rebuild')for(const step of job.steps||[]){const r=M.record(this.find(step.payload?.target));if(r?.type==='diary')throw new Error('This legacy rebuild is not a personal-evidence diary regeneration. Cancel it and use Regenerate saved diary.');}
+        if(job.kind==='condense')for(const step of job.steps||[])for(const id of step.payload?.ids||[]){const r=M.record(this.find(id));if(r?.type==='diary')this.assertDiaryAllowed(r.subject);}
+    }
+    async changeDiaryExclusion(remove=false) {
+        const name=(remove?this.value('diaryBlacklist'):this.value('diaryName').trim()||this.value('diaryCharacter')).trim();
+        if(!name)throw new Error('Choose a character first.');
+        const archive=this.h.settings().lorebook;if(!archive)throw new Error('Choose a story database first.');
+        return this.withLock(async()=>{
+            if(archive!==this.h.settings().lorebook)throw new Error('Story changed. Select the character again.');
+            const roster=this.diaryPolicyRoster(), persona=this.h.context().name1||'', policy=this.diaryPolicy();
+            DiaryPolicy.savePolicy(this.liveState(),DiaryPolicy.setExcluded(policy,roster,persona,name,!remove));
+            await this.persist();this.renderDiaryReader();
+        });
+    }
+    renderDiaryReader() {
+        const node=this.root?.querySelector('#sa-diary-reader');if(!node)return;
+        const name=this.value('diaryName').trim()||this.value('diaryCharacter').trim();
+        this.renderStoryContext(name);
+        const select=this.root.querySelector('[data-sa-field="diarySaved"]');
+        const diaries=name?this.diariesFor(name):[];
+        if(select){const old=select.value;select.innerHTML=diaries.length?diaries.map(e=>`<option value="${html(M.record(e).id)}">${html((M.record(e).dates||[]).join(', ')||'Undated')} · ${html(String(M.record(e).updated||'').slice(0,16).replace('T',' '))}</option>`).join(''):'<option value="">No saved diary</option>';if(diaries.some(e=>M.record(e).id===old))select.value=old;}
+        const diary=name?this.chosenDiary(name):null;
+        if(diary)node.innerHTML=markdownPreview(diary.content);else node.textContent=name?'No saved diary for this individual.':'Choose an individual to read their saved diary.';
+        const reason=name?this.diaryExclusion(name):'';
+        const status=this.root.querySelector('#sa-diary-policy-status');if(status)status.textContent=reason?`${name}: ${reason}. Existing diaries remain readable.`:name?`${name}: Diary generation allowed.`:'Select a character to manage diary access.';
+        const blacklist=this.root.querySelector('[data-sa-field="diaryBlacklist"]');
+        if(blacklist){const policy=this.diaryPolicy(),roster=this.diaryPolicyRoster(),persona=this.h.context().name1||'',old=blacklist.value;
+            const names=M.unique([...policy.blocked,...(persona&&DiaryPolicy.exclusion(policy,roster,persona,persona)?[Cast.matchingCharacter(roster,persona)?.name||persona]:[])]).filter((n,i,a)=>a.findIndex(m=>DiaryPolicy.sameIdentity(roster,n,m))===i);
+            blacklist.innerHTML='<option value="">Choose blocked character</option>'+names.map(n=>`<option value="${html(n)}">${html(n)} — ${html(DiaryPolicy.exclusion(policy,roster,persona,n))}</option>`).join('');if(names.includes(old))blacklist.value=old;
+        }
+        for(const action of ['diary','diaryUpdate','diaryRewrite','diaryRegenerate','diaryCondense']){const b=this.root.querySelector(`[data-sa-action="${action}"]`);if(b){b.disabled=!!reason||!name||(action!=='diary'&&!diary);b.title=reason||'';}}
+        const edit=this.root.querySelector('[data-sa-action=diaryEdit]');if(edit){edit.disabled=!diary;edit.title='Edit saved prose without a model request';}
+    }
+    async addDiaryCharacter() {
+        const name = this.value('diaryName').trim();
+        if (!Cast.usableName(name)) throw new Error('Enter an individual character name (up to 120 characters).');
+        if (!this.h.context().chat?.length) throw new Error('Open the story chat first.');
+        if (!this.h.begin()) throw new Error('An operation is already running.');
+        try {
+            const scope = this.diaryScope(), st = this.liveState();
+            const old = st.diaryCast?.scope === scope ? st.diaryCast : { scope, manual: [], detected: [] };
+            st.diaryCast = { ...old, excluded:(old.excluded||[]).filter(n=>Cast.nameKey(n)!==Cast.nameKey(name)), manual: [...new Map([...(old.manual || []), name].map(n => [Cast.nameKey(n), n])).values()] };
+            await this.persist(); this.fillDiarySelects(name);
+            const input = this.root.querySelector('[data-sa-field="diaryName"]'); if (input) input.value = '';
+            this.h.notify(`${name} added to the story cast.`, 'success');
+        } finally { this.h.end(); }
+    }
+    async excludeDiaryCharacter() {
+        const name=this.value('diaryCharacter');if(!name)throw new Error('Choose the incorrect roster candidate first.');
+        if(!await this.h.confirmText(`Hide ${name} from the character roster? No archive records or diary text will be deleted. Type the name and use Add typed name to restore it.`))return;
+        return this.withLock(async()=>{const scope=this.diaryScope(),st=this.liveState(),old=st.diaryCast?.scope===scope?st.diaryCast:{scope,manual:[],detected:[]};st.diaryCast={...old,excluded:M.unique([...(old.excluded||[]),name])};await this.persist();this.fillDiarySelects();renderTools(this);});
+    }
+    async detectDiaryCast() {
+        const chat = this.h.context().chat || [];
+        if (!chat.length) throw new Error('Open the story chat first.');
+        const scope = this.diaryScope(), origin = this.identity();
+        const from = this.value('diaryFrom'), to = this.value('diaryTo');
+        const range = { from: from === '' ? (to === '' ? Math.max(0, chat.length - 80) : 0) : Number(from), to: to === '' ? chat.length - 1 : Number(to) };
+        const messages = Flow.selectedMessages(chat, range);
+        if (!messages.length) throw new Error('No story messages in that range.');
+        const profile = this.h.settings().diaryProfile || '';
+        const model = this.h.flowModelInfo?.(profile);
+        const capacity = this.helperCapacity(3000, model).input;
+        const limit = Math.min(8000, capacity - M.tokens(Cast.CAST_SYSTEM) - 250);
+        if (limit < 200) throw new Error('The Diary model has too little available context for character detection.');
+        const passes = Core.splitPasses(messages, limit);
+        if (passes.some(p => p.tokens > limit)) throw new Error('One message is too large for this scan. Choose a larger-context Diary model or a smaller range.');
+        if (passes.length > 3 && !(await this.h.confirmText(`Detect story characters in messages ${range.from}–${range.to}? This needs ${passes.length} model requests. Existing diaries are unchanged.`, {okButton:'Detect characters', cancelButton:'Cancel'}))) return;
+        if (origin !== this.identity() || scope !== this.diaryScope() || chat !== this.h.context().chat) throw new Error('The chat changed before detection began.');
+        if (!this.h.begin()) throw new Error('An operation is already running.');
+        const snapshot = this.source(Flow.messageRuns(messages));
+        const status = this.root.querySelector('#sa-diary-cast-status');
+        const button = this.root.querySelector('[data-sa-action="diaryDetect"]');
+        this.detectingDiaryCast = true; if (button) button.disabled = true;
+        let found = [];
+        try {
+            const job = this.liveState().job;
+            if (job?.status === 'running') throw new Error('Finish or pause the current job first.');
+            for (let i = 0; i < passes.length; i++) {
+                if (status) status.textContent = `Detecting characters: pass ${i+1} of ${passes.length}…`;
+                const batch = passes[i].messages;
+                const raw = await this.call(Cast.castRequest(batch), 'Detect diary characters', null, { profile, send: (req, selected) => this.h.model(req, selected) });
+                this.h.assert();
+                if (scope !== this.diaryScope() || origin !== this.identity() || chat !== this.h.context().chat || !M.checkSource(snapshot, this.sourceId(), chat).valid) throw new Error('The source chat changed during detection. No detected names were saved.');
+                found = Cast.mergeDetected(found, Cast.parseCast(raw, batch, chat));
+            }
+            const st = this.liveState();
+            const old = st.diaryCast?.scope === scope ? st.diaryCast : { scope, manual: [], detected: [] };
+            st.diaryCast = { ...old, detected: Cast.mergeDetected(old.detected, found) };
+            await this.persist();
+            this.h.notify(`Detected ${found.length} individual character${found.length === 1 ? '' : 's'} in the selected messages.`, 'success');
+        } finally {
+            this.detectingDiaryCast = false; if (button) button.disabled = false;
+            if (scope === this.diaryScope()) this.fillDiarySelects();
+            this.h.end();
+        }
     }
     renderDashboard() {
         if (!this.root) return;
         const count = type => this.entries.filter(e => M.record(e)?.type === type).length;
-        const n = count('memory');
-        this.root.querySelector('#sa-dashboard').innerHTML = `<span><b>${count('unit')}</b> ${count('unit') === 1 ? 'summary' : 'summaries'}</span><span><b>${count('recap')}</b> ${count('recap') === 1 ? 'recap' : 'recaps'}</span><span><b>${n}</b> ${n === 1 ? 'memory list' : 'memory lists'}</span>${this.selected.size ? `<span><b>${this.selected.size}</b> selected</span>` : ''}`;
+        const n = this.h.settings().databaseOnly ? count('knowledge') + count('fact') + count('thread') : count('memory');
+        this.root.querySelector('#sa-dashboard').innerHTML = this.h.settings().databaseOnly
+            ? `<span><b>${count('unit')}</b> evidence units</span><span><b>${count('memory')}</b> character memories</span><span><b>${n}</b> structured records</span><span><b>${count('recap')}</b> recaps</span>${this.selected.size ? `<span><b>${this.selected.size}</b> selected</span>` : ''}`
+            : `<span><b>${count('unit')}</b> ${count('unit') === 1 ? 'summary' : 'summaries'}</span><span><b>${count('recap')}</b> ${count('recap') === 1 ? 'recap' : 'recaps'}</span><span><b>${n}</b> ${n === 1 ? 'memory list' : 'memory lists'}</span>${this.selected.size ? `<span><b>${this.selected.size}</b> selected</span>` : ''}`;
+        const debug = this.root.querySelector('[data-sa-action="debugToggle"]');
+        if (debug) debug.textContent = Debug.isEnabled() ? 'Disable debug console' : 'Enable debug console';
         this.layout?.refresh();
     }
     filtered() {
@@ -425,7 +628,7 @@ export class Workbench {
         const recapReviews = M.recapReview(this.entries);
         const markup = `<p class="sa-hint">${rows.length} results. Dates, source messages, revisions and protection flags are inside Inspect.</p>` + rows.slice(this.libraryPage * 100, (this.libraryPage + 1) * 100).map(({ entry: e }) => {
             const r = M.record(e), protection = Object.entries(r.protection || {}).filter(([, v]) => v).map(([k]) => k).join(', ');
-            return `<article class="sa-result"><div class="sa-result-head"><label><input type="checkbox" data-sa-select="${html(r.id)}" ${this.selected.has(r.id) ? 'checked' : ''}> <b>${html(M.title(e))}</b></label><span class="sa-badge">${recapReviews.has(r.id) ? 'Recap needs review' : html(r.type)}</span></div><p class="sa-hint">${html(e.world)} · ${html(Tools.sourceLabel(e))} · ~${M.tokens(e.content)} tokens${protection ? ' · ' + html(protection) : ''}</p><p>${html(String(e.content).trim().split('\n').filter(l => /^[-*] /.test(l)).slice(0, 2).join(' ').slice(0, 240))}</p><div class="sa-row">${button('inspect', 'Inspect / edit', `data-id="${html(r.id)}"`)}${button('sources', 'Sources', `data-id="${html(r.id)}"`)}${button('loadDetail', 'Load detail next reply', `data-id="${html(r.id)}"`)}</div></article>`;
+            return `<article class="sa-result"><div class="sa-result-head"><label><input type="checkbox" data-sa-select="${html(r.id)}" ${this.selected.has(r.id) ? 'checked' : ''}> <b>${html(M.title(e))}</b></label><span class="sa-badge">${recapReviews.has(r.id) ? 'Recap needs review' : html(r.type)}</span></div><p class="sa-hint">${html(e.world)} · ${html(Tools.sourceLabel(e))} · ~${M.tokens(e.content)} tokens${protection ? ' · ' + html(protection) : ''}</p><div class="sa-markdown sa-record-preview">${recordPreview(e.content)}</div><div class="sa-row">${button('inspect', 'Inspect / edit', `data-id="${html(r.id)}"`)}${button('sources', 'Sources', `data-id="${html(r.id)}"`)}${this.h.settings().databaseOnly ? '' : button('loadDetail', 'Load detail next reply', `data-id="${html(r.id)}"`)}</div></article>`;
         }).join('') + (rows.length > 100 ? pager : '');
         if (this.libraryRenderedIn === container && this.libraryResultMarkup === markup && container.firstChild) return;
         container.innerHTML = markup; this.libraryRenderedIn = container; this.libraryResultMarkup = markup;
@@ -435,10 +638,16 @@ export class Workbench {
         const el = this.root?.querySelector('#sa-jobs'); if (!el) return;
         const j = this.state().job;
         this.extras?.renderChip(j);
-        if (!j) { el.innerHTML = ''; delete el.dataset.status; return; }
+        const durableGaps = this.extractionGaps();
+        const hasActiveJob = !!j && !['done', 'canceled'].includes(j.status);
+        const durablePanel = durableGaps.length
+            ? `<div class="sa-job"><b>🧩 Deferred structured extraction</b> · ${durableGaps.length} gap${durableGaps.length === 1 ? '' : 's'}<p class="sa-warnline">Scene summaries are complete and searchable. These fact/knowledge/thread fragments remain retryable across future jobs and reloads.</p><div class="sa-row">${button('retryExtractionGaps', `🔁 Retry ${durableGaps.length} extraction gap${durableGaps.length === 1 ? '' : 's'}`, hasActiveJob ? 'disabled' : '')}</div>${hasActiveJob ? '<p class="sa-hint">Finish or discard the current job before retrying deferred extraction gaps.</p>' : ''}</div>`
+            : '';
+        if (!j) { el.innerHTML = durablePanel; delete el.dataset.status; this.layout?.help.refresh(el); return; }
+        const jobGapCount = Array.isArray(j.extractionGaps) ? j.extractionGaps.length : 0;
         const active = !['done', 'canceled'].includes(j.status);
         el.dataset.status = j.status;
-        if (!active) { el.replaceChildren(); return; }
+        if (!active) { el.innerHTML = durablePanel; this.layout?.help.refresh(el); return; }
         const saving = this.isSavingJob(j);
         const stage = j.phase === 'saving' || j.approval ? (saving ? 'saving approved changes' : 'approved changes ready to resume')
             : j.phase === 'review' ? 'ready for one combined review'
@@ -446,20 +655,30 @@ export class Workbench {
         const step = j.steps[j.cursor];
         const progress = j.options?.bulk ? `${j.cursor}/${j.steps.length} steps prepared${j.approvedRecords?.length ? ` · ${j.approvedRecords.length} approved records saved` : ''} · ${stage}` : `${j.cursor}/${j.steps.length} steps saved`;
         const retry = j.status === 'running' && step?.archiveRetry ? ' · requesting a shorter archive' : '';
+        const extractNote = step?.payload?.kind === 'extract'
+            ? ` · structured batch ${j.cursor + 1}/${j.steps.length} · ${step.payload.parts?.length || step.payload.ids?.length || 0} source fragment${(step.payload.parts?.length || step.payload.ids?.length || 0) === 1 ? '' : 's'}`
+            : '';
         const recovery = j.status === 'failed' || j.status === 'paused'
             ? (step?.memoryRaw && !step.memoryAudit ? button('skipMemoryAudit', 'Skip audit and review extracted memories') : '') +
               (step?.condenseDraft ? button('skipCondenseAudit', 'Skip audit and review shorter proposal') : '') +
               (step?.condenseRepair ? button('editRecapDraft', 'Edit recap draft') : '') +
               (canRecoverRecapJSON(j, step) ? button('recoverRecapJSON', 'Recover recap JSON') : '') +
-              (j.draft && j.cursor && j.cursor < j.steps.length ? button('flowReviewReady', 'Review ready results') : '') +
+              (j.draft && j.cursor && j.cursor < j.steps.length ? button('flowReviewReady', 'Review & save ready results') : '') +
               (j.options?.flow?.singleRequest && !j.cursor ? button('flowSeparate', 'Run separate passes') : '') +
               ((step?.oversized || step?.archiveRetry && step.payload.messages?.length > 1) && !j.options?.flow?.singleRequest ? button('flowSplit', 'Split this stage') : '') +
-              (j.options?.flow && step && /profile|connection|provider|rate limit|timeout|gateway/i.test(j.error || '') ? button('flowUseCurrent', 'Use current model') : '') +
+              (step?.payload?.kind === 'extract' ? button('extractConnection', 'Change extraction connection') : j.options?.flow && step && /profile|connection|provider|rate limit|timeout|gateway/i.test(j.error || '') ? button('flowUseCurrent', 'Use current model') : '') +
               (j.options?.flow && step?.payload.source && /messages changed/i.test(j.error || '') ? button('flowRefreshEvidence', 'Refresh this stage from chat') : '') +
               (step?.payload.kind === 'archive' && (step.output?.raw || step.archiveRetry?.raw) ? button('flowEditArchive', 'Edit archive response') : '')
             : '';
+        let routeNote = '';
+        if (step?.payload?.kind === 'extract') {
+            try { const route = this.baseHost.flowModelInfo(this.extractionProfile()); routeNote = `Next extraction connection: ${route.provider || route.api || 'provider'} · ${route.model || route.name} (${this.extractionProfile() ? route.name : 'current model'})`; }
+            catch (e) { routeNote = `Extraction connection unavailable: ${e.message}`; }
+        }
         const error = step?.condenseRepair ? j.error?.split('\n')[0] : j.error;
-        el.innerHTML = `<div class="sa-job"><b>📚 ${html(jobLabel(j.kind))}</b> · ${html(j.status)} · ${html(progress + retry)}<progress max="${Math.max(1, j.steps.length)}" value="${j.cursor}"></progress>${error ? `<p class="sa-warnline">${html(error)}</p>` : ''}<div class="sa-row">${button('jobResume', j.status === 'failed' ? '🔁 Retry failed stage' : '▶️ Resume or review', j.status === 'running' ? 'disabled' : '')}${recovery}${button('jobPause', '⏸️ Pause after this request', j.status !== 'running' || saving ? 'disabled' : '')}${button('jobCancel', '🗑️ Discard unfinished job', saving ? 'disabled' : '')}</div><p class="sa-hint">Discarding ends this job and makes its unsaved results unavailable. Records already written to your lorebooks are kept. Use Resume or review to keep working with prepared results.</p></div>`;
+        const resumeLabel = j.status === 'failed' && step?.payload?.kind === 'extract' ? '🔁 Retry failed batch' : j.status === 'failed' ? '🔁 Retry failed stage' : '▶️ Resume or review';
+        const current = `<div class="sa-job"><b>📚 ${html(jobLabel(j.kind))}</b> · ${html(j.status)} · ${html(progress + retry + extractNote)}<progress max="${Math.max(1, j.steps.length)}" value="${j.cursor}"></progress>${error ? `<p class="sa-warnline">${html(error)}</p>` : ''}${routeNote ? `<p class="sa-hint">${html(routeNote)}</p>` : ''}<p data-sa-pacing-status class="sa-hint" aria-live="polite">${html(this.h.pacingText?.() || '')}</p><div class="sa-row">${button('jobResume', resumeLabel, j.status === 'running' ? 'disabled' : '')}${recovery}${button('jobPause', '⏸️ Pause after this request', j.status !== 'running' || saving ? 'disabled' : '')}${button('jobCancel', '🗑️ Discard unfinished job', saving ? 'disabled' : '')}</div><p class="sa-hint">Discarding ends this job and makes its unsaved results unavailable. Records already written to your lorebooks are kept. Use Resume or review to keep working with prepared results.</p></div>`;
+        el.innerHTML = current + durablePanel;
         this.layout?.help.refresh(el);
     }
     renderBudget() { renderMemoryBudget(this); }
@@ -688,7 +907,7 @@ export class Workbench {
                 learnedAt: get('captureLearned'), howLearned: get('captureHow'), due: get('captureDue'), knowledge: root.querySelector('[data-capture=knowledge]').value,
                 source: this.source(ranges), protection: { detailed: false, exact: root.querySelector('[data-capture=exact]').checked, locked: false, pinned: false } };
             const content = type === 'knowledge' ? M.knowledgeText(extra, body) : `## ► ${type === 'thread' ? 'Thread' : type === 'fact' ? 'Fact' : 'Clip'} — ${subject || 'Captured passage'}\n\n[${extra.dates.join('; ')}]\n- ${body}${extra.due ? '\n- Deadline: ' + extra.due : ''}`;
-            this.add(books, type, content, extra, ['fact', 'thread'].includes(type)); await this.write(books, bases, 'Quick capture');
+            this.add(books, type, content, extra, false); await this.write(books, bases, 'Quick capture');
         });
     }
 
@@ -700,8 +919,9 @@ export class Workbench {
         if (!steps.length) throw new Error('There are no matching sources to process.');
         const bulk = !!options.flow || this.options().reviewMode !== 'step' && ['archive', 'memories', 'memory-audit', 'condense', 'extract', 'trackers'].includes(kind);
         const followups = !options.flow && kind === 'archive' ? [...(this.state().followups || [])] : [];
-        return this.withLock(async () => {
-            const pipeline = (options.auditAfter ? ['audit'] : followups.flatMap(s => s === 'memories' ? ['memories', 'audit'] : [s]))
+        const result = await this.withLock(async () => {
+            const pipeline = [...(options.pipeline || []), ...(kind === 'archive' && this.h.settings().databaseOnly ? ['memories','extract'] : []), ...(options.auditAfter ? ['audit'] : followups.flatMap(s => s === 'memories' ? ['memories', 'audit'] : [s]))]
+                .filter((stage, index, list) => list.indexOf(stage) === index)
                 .filter(stage => stage !== 'audit' || this.automaticMemoryAuditAllowed());
             for (const p of steps) if (p.source && M.checkSource(p.source, p.source.chatId, this.h.context().chat || []).valid) Object.assign(p.source, { chatId: this.sourceId(), actualChatId: this.identity(), label: String(this.h.context().chatId || '') });
             const requestLimit = options.flow ? 0 : await previewJob(this, kind, steps, options);
@@ -709,8 +929,11 @@ export class Workbench {
             await this.queue.create(kind, steps, { ...options, requestLimit, bulk, pipeline, hasFollowups: pipeline.length > 0, archive: this.h.settings().lorebook, storyId: this.state().storyId });
             if (kind === 'continuity') { this.state().findings = []; this.state().findingsRun = this.state().job.id; this.state().findingsScope = options.continuityScope || 'Continuity check'; await this.persist(); this.renderFindings([]); }
             if (bulk && kind === 'archive') { this.state().followups = []; await this.persist(); }
-            return this.queue.resume();
+            Debug.info('JOB_CREATED', `Started ${kind} job with ${steps.length} initial stage${steps.length === 1 ? '' : 's'}.`, { kind, stages: steps.length, pipeline });
+            return this.resumeWithAutoSplit();
         });
+        await this.afterArchiveJob(result);
+        return result;
     }
     async extendBulk(job) {
         return this.inBulk(job, async () => {
@@ -719,10 +942,14 @@ export class Workbench {
                 const stage = job.options.pipeline[0]; let steps = [];
                 if (stage === 'memories') {
                     const pending = M.pendingMemoryUnits(this.entries);
-                    steps = this.chunks(pending, this.h.settings().memoryDays || 4).map(g => this.inputStep(g, { kind: 'memories' }));
+                    steps = this.chunks(pending, Math.min(2,this.h.settings().memoryDays || 2)).map(g => this.inputStep(g, { kind: 'memories', mode: 'archive', messages: [], force: false, allUnits: false, archiveStage: false }));
                 } else if (stage === 'audit') {
                     const entries = this.automaticMemoryAuditAllowed() ? this.memoryAuditEntries() : [];
                     steps = this.auditSteps(entries);
+                } else if (stage === 'extract') {
+                    const ids = new Set((this.bulkRun?.data.archiveRanges || []).flatMap(item => item.range.ids || []));
+                    const entries = this.entries.filter(e => ids.has(M.record(e)?.id) && M.record(e)?.type === 'unit' && M.active(e));
+                    steps = this.extractionSteps(entries);
                 } else if (stage === 'trackers') steps = this.trackerSteps(null, true);
                 job.options.pipeline.shift();
                 if (steps.length) {
@@ -746,6 +973,205 @@ export class Workbench {
         }
         if (current.length) out.push(current); return out;
     }
+    extractionProfile() { return this.baseHost.settings().sideProfile || ''; }
+    extractionCapacity() {
+        // 6k is the extraction reply allowance, independent of the main RP reply length.
+        return this.helperCapacity(6000, this.h.flowModelInfo?.(this.extractionProfile()));
+    }
+    extractionSteps(entries) {
+        if (!entries.length) return [];
+        const limit = Extract.extractionBudget(this.extractionCapacity());
+        return Extract.planExtraction(entries, this.inputStep(entries, { kind: 'extract' }), limit,
+            Math.max(1, Math.min(3, Number(this.options().batchSize) || 3)));
+    }
+    async prepareExtractionStage(job, step) {
+        await this.loadBooks();
+        const entries = this.inputs(step), payload = step.payload;
+        const limit = Extract.extractionBudget(this.extractionCapacity());
+        const plans = Extract.planExtraction(entries, payload, limit, Math.max(1, Math.min(3, Number(this.options().batchSize) || 3)));
+        if (!plans.length) throw new Error('No source entries remain in this extraction stage.');
+        if (plans.length === 1) { Object.assign(payload, plans[0]); return false; }
+        this.replaceExtractionStage(job, plans, 'Bounded structured extraction');
+        return true;
+    }
+    replaceExtractionStage(job, plans, reason) {
+        const old = job.steps[job.cursor];
+        job.steps.splice(job.cursor, 1, ...plans.map(payload => ({ id: M.uid(), payload, status: 'pending' })));
+        Debug.info('EXTRACT_STAGE_SPLIT', reason, { sourceCount: old.payload.ids?.length || 0, replacements: plans.length, stage: job.cursor + 1 });
+    }
+    async splitFailedExtraction(job, step) {
+        if ((step?.payload?.kind || job.kind) !== 'extract' || step.output != null) return false;
+        if (!(step?.extractRetry?.splitReady || Number(step?.extractRetry?.attempts || 0) >= 2)) return false;
+        return this.inBulk(job, async () => {
+            await this.loadBooks();
+            const entries = this.inputs(step), parts = Extract.extractionParts(entries, step.payload);
+            const largest = Math.max(...parts.map(p => M.tokens(p.text)));
+            // Do not refuse a split merely because the failed fragment is already small.
+            // A provider can return a one-token "{" reply even for a ~500-token request;
+            // keep halving until the extraction planner reaches its safe 200-token floor.
+            const limit = parts.length > 1 ? Math.max(200, largest) : Math.max(200, Math.floor(largest / 2));
+            const plans = Extract.planExtraction(entries, step.payload, limit, 1);
+            if (plans.length < 2) return false;
+            this.replaceExtractionStage(job, plans, 'Structured JSON failed validation; split only the failed evidence');
+            job.status = 'paused'; delete job.error;
+            return true;
+        });
+    }
+    async deferFailedExtraction(job, step) {
+        if ((step?.payload?.kind || job.kind) !== 'extract' || step.output != null) return false;
+        if (!(step?.extractRetry?.splitReady || Number(step?.extractRetry?.attempts || 0) >= 2)) return false;
+        return this.inBulk(job, async () => {
+            const gap = {
+                id: step.id,
+                at: M.now(),
+                payload: M.copy(step.payload),
+                error: String(step.extractRetry?.error || step.error || job.error || 'Structured extraction could not be recovered.'),
+                diagnostics: M.copy(step.extractRetry?.diagnostics || null),
+                attempts: Number(step.extractRetry?.attempts || 0),
+            };
+            const gaps = (job.extractionGaps ??= []);
+            const existing = gaps.findIndex(item => item.id === gap.id);
+            if (existing >= 0) gaps[existing] = gap; else gaps.push(gap);
+            step.output = [];
+            step.status = 'done';
+            step.completed = M.now();
+            delete step.error;
+            delete step.extractRetry;
+            job.status = 'paused';
+            delete job.error;
+            Debug.warn('EXTRACT_STAGE_DEFERRED', 'A structured extraction fragment stayed malformed after repair/splitting and was deferred so the archive can continue.', {
+                stage: job.cursor + 1,
+                sourceIds: gap.payload.ids || [],
+                parts: gap.payload.parts || [],
+                error: gap.error,
+            });
+            return true;
+        });
+    }
+    extractionGaps() {
+        const durable = this.liveState().extractionGaps;
+        if (Array.isArray(durable)) return durable;
+        const job = this.liveState().job;
+        return Array.isArray(job?.extractionGaps) ? job.extractionGaps : [];
+    }
+    async syncExtractionGaps(job) {
+        if (!job || job.status !== 'done') return;
+        const state = this.liveState();
+        const byId = new Map((Array.isArray(state.extractionGaps) ? state.extractionGaps : []).map(gap => [gap.id, M.copy(gap)]));
+        for (const id of job.options?.retryGapIds || []) byId.delete(id);
+        for (const gap of job.extractionGaps || []) byId.set(gap.id, M.copy(gap));
+        const next = [...byId.values()];
+        if (next.length) state.extractionGaps = next;
+        else delete state.extractionGaps;
+        await this.persist();
+    }
+    async migrateExtractionGaps() {
+        const state = this.liveState(), job = state.job;
+        if (job?.status !== 'done' || !Array.isArray(job.extractionGaps) || !job.extractionGaps.length) return;
+        const byId = new Map((Array.isArray(state.extractionGaps) ? state.extractionGaps : []).map(gap => [gap.id, M.copy(gap)]));
+        let changed = false;
+        for (const gap of job.extractionGaps) if (!byId.has(gap.id)) { byId.set(gap.id, M.copy(gap)); changed = true; }
+        if (changed) { state.extractionGaps = [...byId.values()]; await this.persist(); }
+    }
+
+    async extractStructured(job, step, inputs) {
+        const fragments = Extract.extractionInputs(inputs, step.payload);
+        const req = { ...M.extractionRequest(fragments, this.h.context().name1), maxTokens: this.extractionCapacity().output, preserveJson: true };
+        const transport = { profile: this.extractionProfile(), send: (request, selected) => this.h.model(request, selected) };
+        req.system += '\nUse compact JSON. Omit optional empty fields. Extract only consequential, source-supported facts, knowledge and unresolved threads. Do not repeat the same proposition. Always close the JSON object. Each source may be a fragment; do not assume facts from omitted portions.';
+        const authorRoster=this.diaryPolicyRoster(),authorContext=this.diaryStoryContext(authorRoster);
+        const profileInstructions=ScannedAuthors.authorExtractionInstructions(authorContext,fragments);
+        const plainSystem=req.system;
+        const estimate=await this.h.tokenCount?.(plainSystem+profileInstructions+'\n'+req.prompt+StoryContext.settingBlock(this.storyContext()));
+        const useProfiles=this.extractionCapacity().output>=1500&&(Number(estimate)||M.tokens(plainSystem+profileInstructions+'\n'+req.prompt+StoryContext.settingBlock(this.storyContext())))<=this.extractionCapacity().input;
+        if(useProfiles)req.system+=profileInstructions;
+        const decode=raw=>{
+            const records=M.extractionResult(raw,fragments);
+            if(useProfiles){try{ScannedAuthors.attachScannedAuthors(records,raw,fragments,authorRoster,authorContext,inputs);}catch(error){Debug.warn('DIARY_PROFILE_METADATA_SKIPPED','Optional author guidance was ignored: '+String(error?.message||error));}}
+            return records;
+        };
+        const label = 'structured memories';
+        const rememberFailure = async (kind, raw, error, extra = {}) => {
+            const previous = Array.isArray(step.extractRetry?.history) ? step.extractRetry.history : [];
+            step.extractRetry = {
+                attempts: Number(step.extractRetry?.attempts || 0) + (kind === 'source' ? 1 : 0),
+                error: error.message, raw, at: M.now(), history: [...previous, { kind, error: error.message, raw, at: M.now() }].slice(-6),
+                ...extra,
+            };
+            await this.persist();
+        };
+        const repairJSONOnly = async (raw, firstError) => {
+            const ids = M.unique(fragments.map(e => M.record(e).id));
+            const tokens = Math.max(900, Math.min(this.extractionCapacity().output, M.tokens(raw) + 500));
+            const repair = {
+                system: `Repair one malformed JSON reply. Return ONLY one valid JSON object with top-level shape {"records":[...],"diaryAuthors":[...]} (diaryAuthors optional; preserve only already present complete profiles with allowed sourceIds). Preserve only records already present in the malformed reply; do not add story facts, infer missing content, or rewrite the evidence. Remove prose, markdown and duplicate wrappers. Every sourceIds value must be one of the allowed IDs. If an individual record is syntactically unrecoverable, omit only that record.`,
+                prompt: `ALLOWED SOURCE IDS\n${JSON.stringify(ids)}\n\nVALIDATION ERROR\n${firstError.message}\n\nMALFORMED REPLY\n${raw}`,
+                maxTokens: tokens, preserveJson: true,
+            };
+            return this.call(repair, 'structured JSON repair', null, transport);
+        };
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (job.status !== 'running') throw new Error('Structured extraction paused after the current request. Resume when ready.');
+            const sourceReq = attempt ? { ...req, system: plainSystem + '\nPrevious reply could not be recovered. Use fewer, shorter records. Return exactly one complete JSON object and no prose or Markdown.' } : req;
+            let raw;
+            try {
+                raw = await this.call(sourceReq, attempt ? label + ', source retry' : label, null, transport);
+            } catch (requestError) {
+                const message = String(requestError?.message || requestError);
+                if (!/returned no text|connection returned no text|empty or incomplete content/i.test(message)) throw requestError;
+                const diagnostics = { text: '', quoted: false, curly: 0, square: 0, empty: true, likelyTruncated: true };
+                await rememberFailure('source', '', requestError, { diagnostics, splitReady: attempt === 1 });
+                if (job.status !== 'running') throw new Error('Structured extraction paused after the current request. Resume when ready.');
+                if (attempt === 1) throw new Error('Structured extraction returned no content twice; the failed batch will be split automatically.');
+                continue;
+            }
+            try {
+                const result = decode(raw);
+                delete step.extractRetry; return result;
+            } catch (error) {
+                const diagnostics = M.jsonReplyDiagnostics(raw);
+                await rememberFailure('source', raw, error, { diagnostics });
+                if (job.status !== 'running') throw new Error('Structured extraction paused after the current request. Resume when ready.');
+
+                // A clearly truncated object cannot be made complete without re-reading evidence.
+                // Split it immediately instead of burning another same-size source request.
+                if (diagnostics.likelyTruncated) {
+                    step.extractRetry.splitReady = true;
+                    await this.persist();
+                    throw new Error('Structured extraction reply was truncated; the failed batch will be split automatically.');
+                }
+
+                // Syntax/wrapper damage can often be repaired cheaply from the reply itself.
+                // Pause is a hard request boundary: never send a repair after the user latched Pause.
+                if (job.status !== 'running') throw new Error('Structured extraction paused after the current request. Resume when ready.');
+                let repairRaw = '';
+                try {
+                    repairRaw = await repairJSONOnly(raw, error);
+                    const result = decode(repairRaw);
+                    const recordHints = (String(raw).match(/["']?type["']?\s*:/gi) || []).length;
+                    if (recordHints > 0 && result.length === 0) throw new Error('JSON repair discarded all attempted records; re-read the source instead.');
+                    if (!Array.isArray(step.extractRetry.history)) step.extractRetry.history = [];
+                    step.extractRetry.history.push({ kind: 'repair', raw: repairRaw, at: M.now(), error: '' });
+                    delete step.extractRetry;
+                    return result;
+                } catch (repairError) {
+                    if (isRateLimit(repairError) || job.status !== 'running') throw repairError;
+                    await rememberFailure('repair', repairRaw, repairError, { splitReady: attempt === 1 });
+                }
+
+                if (job.status !== 'running') {
+                    await this.persist();
+                    throw new Error('Structured extraction paused after the current request. Resume when ready.');
+                }
+                if (attempt === 1) {
+                    if (step.extractRetry) step.extractRetry.splitReady = true;
+                    await this.persist();
+                    throw new Error('Structured extraction could not validate or repair the reply: ' + (step.extractRetry?.error || error.message));
+                }
+            }
+        }
+    }
     inputStep(entries, extra = {}) { return { ids: entries.map(e => M.record(e).id), hashes: Object.fromEntries(entries.map(e => [M.record(e).id, M.hash(e.content)])), ...extra }; }
     inputs(step) {
         return (step.payload.ids ?? []).map(id => {
@@ -753,6 +1179,17 @@ export class Workbench {
             if (step.payload.hashes?.[id] && M.hash(e.content) !== step.payload.hashes[id]) throw new Error('A queued source changed. Cancel this job and review the corrected source before retrying.');
             return e;
         });
+    }
+
+    async retryExtractionGaps() {
+        const current = this.liveState().job;
+        if (current && !['done', 'canceled'].includes(current.status) || this.queue.running) return;
+        const gaps = this.extractionGaps();
+        const valid = gaps.filter(gap => gap?.payload?.kind === 'extract');
+        const steps = valid.map(gap => M.copy(gap.payload));
+        if (!steps.length) return;
+        if (!(await this.h.confirmText(`Retry ${steps.length} deferred structured-extraction gap${steps.length === 1 ? '' : 's'}? The completed scene archive is not regenerated.`, { okButton: 'Retry gaps' }))) return;
+        return this.createJob('extract', steps, { pipeline: [], retryGapIds: valid.map(gap => gap.id) });
     }
 
     renderFlow() {
@@ -830,8 +1267,10 @@ export class Workbench {
     }
 
     flowSettings() {
-        return { memorySource: 'chat', scope: 'new', persona: false, readReferences: false, includeChatContext: false,
+        const value = { memorySource: 'chat', scope: 'new', persona: false, readReferences: false, includeChatContext: false,
             references: [], referenceBudget: 0, referenceFit: 'all', auditMemories: false, sharedMode: 'new', singleRequest: false, rolling: false, rollingEvery: 30, rollingBuffer: 4, ...this.liveState().flowSettings };
+        if (this.h.settings().databaseOnly) Object.assign(value, { persona: false, readReferences: false, auditMemories: false, rolling: false });
+        return value;
     }
 
     async startFlow(action, range = null, onlyTracker = null, estimateOnly = false) {
@@ -845,8 +1284,11 @@ export class Workbench {
         }
         const chat = this.h.context().chat, prefs = this.flowSettings(), s = this.h.settings(), origin = this.identity();
         const archive = action === 'archive' || action === 'catch-up';
-        const memories = action === 'memories' || action === 'catch-up' || (archive && (range ? this.checked('rangeMemories') : s.memoryAuto));
-        const trackers = action === 'trackers' || action === 'catch-up' || (archive && s.trackerAuto);
+        // Database mode still creates source-backed character memories for browsing/retrieval.
+        // It only disables ambient prompt delivery. Normal archive scans create memories in a
+        // follow-up pipeline after the newly archived units exist, avoiding duplicate extraction.
+        const memories = action === 'memories' || action === 'catch-up' || (!s.databaseOnly && archive && (range ? this.checked('rangeMemories') : s.memoryAuto));
+        const trackers = !s.databaseOnly && (action === 'trackers' || action === 'catch-up' || (archive && s.trackerAuto));
         const selected = range?.messages ?? (range ? Flow.selectedMessages(chat, range) : null);
         const snapshot = messages => this.source(Flow.messageRuns(messages));
         const archiveMessages = archive ? (selected ? selected.filter(message => !isSkipped(this.h.meta().rangeControl, chat[message.idx])) : Flow.uncoveredArchiveMessages(chat, this.h.meta())) : [];
@@ -862,9 +1304,13 @@ export class Workbench {
         if (referencePlan?.omitted.length && !estimateOnly) this.h.notify(`Using ${referencePlan.selected.length} complete reference entries; ${referencePlan.omitted.length} omitted under your reference allowance. Estimate this run shows the selection.`, 'info');
         const steps = [];
         if (archiveMessages.length) {
-            steps.push({ kind: 'archive', source: snapshot(archiveMessages), messages: archiveMessages,
-                from: archiveMessages[0].idx, to: archiveMessages.at(-1).idx, explicit: !!range,
-                sharedMode: prefs.sharedMode, sharedUnit: this.value('sharedUnit') === '' ? null : Number(this.value('sharedUnit')) });
+            const passLimit = Math.max(2000, Number(s.scanBatchTokens) || 12000);
+            const sceneDate = this.sceneRecall.frame().flashback || '';
+            for (const pass of Core.splitPasses(archiveMessages, passLimit)) steps.push({
+                kind: 'archive', source: snapshot(pass.messages), messages: pass.messages,
+                from: pass.from, to: pass.to, explicit: !!range, sceneDate,
+                sharedMode: prefs.sharedMode, sharedUnit: this.value('sharedUnit') === '' ? null : Number(this.value('sharedUnit')),
+            });
         }
         const source = prefs.memorySource;
         const units = M.pendingMemoryUnits(this.entries, { redo: true });
@@ -914,7 +1360,7 @@ export class Workbench {
         flow.singleRequest = flow.singleRequest && !flow.auditMemories && steps.length > 1 && new Set(steps.map(step => flow.profiles[stage(step)])).size === 1;
         if (estimateOnly) return this.extras?.estimate(steps, flow);
         if (this.options().jobPreview && !(await this.extras?.estimate(steps, flow, true))) return;
-        return this.createJob(action, steps, { flow, hide: !!(range ? this.checked('rangeHide') : s.hideArchived) });
+        return this.createJob(action, steps, { flow, hide: false, pipeline: archive && s.databaseOnly ? ['memories', 'extract'] : [] });
     }
 
     replyExclusion(entries, { group = this.h.groupSpeaker?.(), recaps = M.recapReview(entries), time = this.sceneRecall.restriction() } = {}) {
@@ -973,7 +1419,7 @@ export class Workbench {
         const otherNotes = notes.filter(note => !showing.has(note.id)).map(note => {
             const blocked = note.thread === 'closed' ? 'Resolved thread'
                 : !Little.noteAudience(note, scene.speaker) ? 'Outside the speaking character’s knowledge'
-                : opts.sceneRecall && scene.frame.flashback && (!note.date || note.date > scene.frame.flashback) ? 'Outside this flashback' : '';
+                : opts.sceneRecall && scene.frame.flashback && (!note.date || note.date > scene.frame.flashback) ? 'After the active scene date' : '';
             return { note, blocked: !!blocked, reason: choices.get('little:' + note.id) === 'skip' ? 'Skipped once'
                 : blocked || (matched.has(note.id) ? 'Little Things budget' : opts.sceneRecall ? 'No recent cue' : 'Scene Recall is off') };
         });
@@ -1014,7 +1460,7 @@ export class Workbench {
     }
 
     async startArchiveRange() { return this.startFlow('archive', this.previewRange()); }
-    async archiveWorkflow(thorough = false) { return this.startFlow(thorough ? 'catch-up' : 'archive'); }
+    async archiveWorkflow() { return this.startFlow('archive'); }
     async continueWorkflow() {
         if (this.state().job && !['done', 'canceled'].includes(this.state().job.status)) return;
         while (this.state().followups?.length) {
@@ -1026,7 +1472,8 @@ export class Workbench {
         }
         await this.refresh();
     }
-    async startCondense(entries, automatic = false, individual = false, recapLabel = '') {
+    async startCondense(entries, automatic = false, individual = false, recapLabel = '', extraOptions = {}) {
+        for(const e of entries)if(M.record(e)?.type==='diary')this.assertDiaryAllowed(M.record(e).subject);
         const reviews = M.recapReview(this.entries);
         let eligible = entries.filter(e => M.eligible(e) && !reviews.has(M.record(e).id));
         if (!eligible.length && entries.some(e => reviews.has(M.record(e)?.id))) throw new Error('A selected recap needs review. Repair it or select its original entries.');
@@ -1049,15 +1496,16 @@ export class Workbench {
         });
         if (!groups.length) throw new Error('These records are too short for a recap to save tokens. No model request was made.');
         if (skipped) this.h.notify(`Skipped ${skipped} records whose required headings and chronology leave no room for a smaller result.`, 'info');
-        return this.createJob('condense', groups.map(g => this.inputStep(g)), { mode, label, automatic, auditCondense: this.options().auditCondense, target: Math.max(0, Number(this.value('condenseTarget')) || 0) });
+        return this.createJob('condense', groups.map(g => this.inputStep(g)), { mode, label, automatic, auditCondense: this.options().auditCondense, target: Math.max(0, Number(this.value('condenseTarget')) || 0), ...extraOptions });
     }
     async startExtract() {
         const entries = this.selectedEntries().filter(e => M.active(e) && !['diary', 'opening', 'closing'].includes(M.record(e).type));
-        return this.createJob('extract', this.chunks(entries).map(g => this.inputStep(g)));
+        return this.createJob('extract', this.extractionSteps(entries));
     }
     async startRegenerate(id) {
         const target = this.find(id); if (!target) throw new Error('That record is missing.');
         const r = M.record(target);
+        if(r.type==='diary')return this.startDiary(false,false,true,id);
         if (r.protection?.locked || r.protection?.exact) throw new Error('Unlock the record before rebuilding it.');
         const sourceIds = M.unique([...(r.derivedFrom || []), ...(r.covers || [])]);
         const inputs = sourceIds.map(i => this.find(i)).filter(Boolean);
@@ -1163,49 +1611,184 @@ export class Workbench {
     }
     async startTrackers(onlyId = null) { return this.startFlow('trackers', null, onlyId); }
     diaryCharacter() {
-        const pick = this.value('diaryCharacter'), cards = this.h.context().characters || [];
-        const card = pick.startsWith('c:') ? cards[Number(pick.slice(2))] : null;
-        const name = this.value('diaryName').trim() || (pick.startsWith('m:') ? pick.slice(2) : card?.name || card?.data?.name || '');
-        if (!name) throw new Error('Choose a diary character or enter their name.');
-        const chosen = card || cards.find(c => (c.name || c.data?.name || '').toLocaleLowerCase() === name.toLocaleLowerCase());
-        const data = chosen?.data || chosen || {};
-        return { name, card: chosen, defs: { name, description: data.description, personality: data.personality, scenario: data.scenario, examples: data.mes_example } };
+        const name = this.value('diaryName').trim() || this.value('diaryCharacter').trim();
+        if(name && !Cast.usableName(name)) throw new Error('Choose an individual character, not a location, organization, object or group.');
+        if (!name) throw new Error('Choose a story character, detect the cast, or enter an individual name.');
+        return Cast.diaryBackground(this.h.context(), Cast.matchingCharacter(this.diaryRoster(),name)?.name || name);
     }
 
-    latestDiary(name) {
-        const diaries = this.entries.filter(e => M.record(e)?.type === 'diary' && M.record(e).subject?.toLocaleLowerCase() === name.toLocaleLowerCase());
-        return diaries.sort((a, b) => String(M.record(b).updated).localeCompare(String(M.record(a).updated)))[0];
+    diariesFor(name) {
+        const names=new Set(DiaryPolicy.identityNames(this.diaryPolicyRoster(),name).map(Cast.nameKey));
+        return this.entries.filter(e=>M.record(e)?.type==='diary'&&M.active(e)&&names.has(Cast.nameKey(M.record(e).subject))).sort((a,b)=>String(M.record(b).updated).localeCompare(String(M.record(a).updated)));
+    }
+    latestDiary(name) { return this.diariesFor(name)[0]; }
+    chosenDiary(name) { const diaries=this.diariesFor(name),id=this.value('diarySaved');return diaries.find(e=>M.record(e).id===id)||diaries[0]; }
+
+    vectorProgress(text) { const node=this.root?.querySelector('#sa-archive-vector-status'); if(node)node.textContent=text; }
+    async syncVectors() {
+        return this.withLock(async()=>{await this.loadBooks();if(!this.h.settings().lorebook)throw new Error('Choose a story database first.');
+            if(!(await this.h.confirmText('Index this story’s active evidence with the selected embedding provider? It sends archive text to that provider. Existing matching vectors are reused; no RP model calls are made.')))return;
+            this.vectorProgress('Preparing archive index…');
+            try{const result=await Vectors.syncArchiveVectors(this);this.vectorProgress(`${result.records} records / ${result.chunks} chunks indexed; ${result.added} added, ${result.removed} obsolete removed.`);this.h.notify('Archive vector index synchronized.','success');}
+            catch(error){this.vectorProgress(error.message);throw error;}
+        });
+    }
+    rerankProgress(message) {
+        const node=this.root?.querySelector('#sa-rerank-status');if(node)node.textContent=message;
+    }
+    setRerankKey(value) { Rerank.setRerankKey(this,value);this.rerankProgress(value?'Session credential set for this endpoint.':'Session credential cleared.'); }
+    clearRerankKey() { Rerank.clearRerankKey(this);const input=this.root?.querySelector('[data-sa-field="rerankKey"]');if(input)input.value=''; }
+    async testReranker() {
+        return this.withLock(async()=>{this.rerankProgress('Testing with synthetic example documents…');try{
+            const rows=await Rerank.testRerankConnection(this);
+            this.rerankProgress(`Connection OK · ranked ${rows.length} test documents. ${rows[0]?.index===(this.options().archiveRerankProvider==='ollama'?1:0)?'Expected match ranked first.':'Expected match not first; check model suitability.'}`);
+        }catch(error){this.rerankProgress(error.message);throw error;}});
+    }
+    async testVectors() {
+        return this.withLock(async()=>{await this.loadBooks();const query=this.value('archiveVectorQuery').trim();if(!query)throw new Error('Enter a semantic search query.');
+            const identity=this.identity(),entries=[...this.entries,...this.littleThings().map(n=>Vectors.archiveNoteEntry(n,this.state().storyId))];
+            const node=this.root?.querySelector('#sa-vector-preview');
+            const eligible=entries.filter(e=>M.active(e)&&!e.disable);
+            const keywords=M.search(eligible,query);
+            const snippet=(entry,text)=>{const body=String(entry.content||'');const terms=M.queryTerms(query);const lower=body.toLocaleLowerCase();const matches=terms.map(t=>lower.indexOf(t)).filter(i=>i>=0);const at=matches.length?Math.max(0,Math.min(...matches)-80):0;return (at?'…':'')+body.slice(at,at+320)+(body.length>at+320?'…':'');};
+            const render=(rows,stats,error='')=>{if(!node)return;
+                const description=stats?Vectors.vectorSearchStatus(stats):error;
+                const counts=stats?`<p class="sa-hint">${stats.indexed}/${stats.expected} current chunks indexed · ${stats.stored} stored · ${stats.missing} missing · ${stats.raw} ranked before threshold · ${stats.above} passed threshold · ${stats.eligibleAbove} validated${stats.limited?' · bounded shortlist':''}</p>`:'';
+                const cards=rs=>rs.map(r=>`<article class="sa-result"><b>${html(M.title(r.entry))}</b><p>${html(snippet(r.entry))}</p></article>`).join('');
+                node.innerHTML=`<h4>Semantic matches (${rows.length})</h4><p>${html(description)}</p>${counts}${cards(rows)}<h4>Keyword matches (${keywords.length})</h4><p class="sa-hint">Exact term matching; these are not vector scores. Author preview, no NPC or scene-date filter.</p>${cards(keywords.slice(0,10))||'<p>No keyword matches.</p>'}`;
+            };
+            try{const {rows,stats}=await Vectors.inspectArchiveSearch(this,entries,query);if(identity!==this.identity())throw new Error('The story changed during search.');
+                this.vectorProgress(`${rows.length} semantic matches · ${keywords.length} keyword matches · ${stats.indexed}/${stats.expected} current chunks indexed.`);render(rows,stats);
+            }catch(error){if(identity===this.identity()){this.vectorProgress(error.message);render([],null,error.message);}throw error;}
+        });
+    }
+    async backfillFromKnowledge() {
+        return this.withLock(async()=>{await this.loadBooks();const running=this.liveState().job;if(running&&!['done','canceled'].includes(running.status))throw new Error('Finish or pause and save the current job before rebuilding character lists.');
+            const plans=Character.memoryProjection(this.entries,this.diaryRoster(),this.h.settings().unit),books=M.copy(this.books),bases=this.bases();
+            const changes=[];
+            for(const plan of plans){const names=new Set([plan.person.name,...plan.person.aliases].map(Cast.nameKey));if(this.entries.some(e=>M.record(e)?.type==='memory'&&M.active(e)&&names.has(Cast.nameKey(M.record(e).subject))))continue;
+                changes.push({title:plan.person.name,content:plan.content,plan,optional:true});}
+            if(!changes.length){this.h.notify('No missing lists can be built from existing personal knowledge. Use Scan missing character memories for deeper extraction.','info');return;}
+            if(!(await this.review(changes,'Build missing character memory lists','Uses existing character-specific knowledge only. No model requests, no deleted records, no scene rescanning. These are initial lists, not full episodic memory extraction. Existing lists are untouched.',{partial:true})))return;
+            for(const change of changes.filter(c=>c.include!==false)){const p=change.plan;if(change.content!==p.content)throw new Error('This projection preserves exact source links. Save it unchanged, then edit the list in Inspect.');const e=this.add(books,'memory',p.content,{subject:p.person.name,aliases:p.person.aliases,derivedFrom:p.sources.map(e=>M.record(e).id),memoryEvidence:p.links,projection:'structured-knowledge-v1'},false);e.comment='🧠| Memories · '+p.person.name;}
+            await this.write(books,bases,'Build missing character lists from existing knowledge');
+        });
+    }
+    async startDiary(update = false, rewrite = false, regenerate = false, explicitId = '') {
+        const explicit=explicitId?this.find(explicitId):null;
+        if(explicitId&&(M.record(explicit)?.type!=='diary'||!M.active(explicit)))throw new Error('The selected diary is missing or inactive.');
+        const {name,defs}=explicit?Cast.diaryBackground(this.h.context(),M.record(explicit).subject):this.diaryCharacter(); const origin=this.identity(); const date=this.value('diaryDate').trim(),from=this.value('diaryFrom'),to=this.value('diaryTo'),style=this.value('diaryStyle');
+        this.assertDiaryAllowed(name);
+        if(!(await this.h.ensureArchive()))return;await this.refresh();if(this.identity()!==origin)throw new Error('Story changed. Select the diary again.');this.assertDiaryAllowed(name);
+        const target=explicitId?this.find(explicitId):(update||rewrite||regenerate)?this.chosenDiary(name):null;
+        if((update||rewrite||regenerate)&&!target)throw new Error('Write this character’s first diary first.');
+        if(target&&['locked','exact','detailed'].some(flag=>M.record(target).protection?.[flag]))throw new Error('Unlock the diary before changing it.');
+        const {step}=this.planDiary(name,{defs,date,from,to,style,target,update,rewrite,regenerate});
+        return this.createJob('diary',[step],{flow:{profiles:{diary:this.h.settings().diaryProfile||''}}});
     }
 
-    async startDiary(update = false) {
-        const chat = this.h.context().chat || [];
-        if (!chat.length) throw new Error('Open the source chat first.');
-        const { name, card, defs } = this.diaryCharacter();
-        if (!(await this.h.ensureArchive())) return;
-        await this.refresh();
-        const target = update ? this.latestDiary(name) : null;
-        if (update && !target) throw new Error('Write this character’s first diary before updating it.');
-        if (target && ['locked', 'exact', 'detailed'].some(flag => M.record(target).protection?.[flag])) throw new Error('Unlock the diary in Library before updating it.');
-        const from = this.value('diaryFrom'), to = this.value('diaryTo');
-        const previous = target ? recordSources(M.record(target)).filter(source => source.chatId === this.sourceId()).map(source => ({ source })) : [];
-        const messages = from !== '' || to !== '' ? M.messageRange(chat, from, to).messages : Flow.uncoveredMemoryMessages(chat, previous);
-        if (!messages.length) { this.h.notify('There are no new chat messages for this diary. Choose an exact range to write about earlier events.', 'info'); return; }
-        const origin = this.identity();
-        const lore = await this.h.readDiaryLore?.(card) || '';
-        if (origin !== this.identity() || chat !== this.h.context().chat) throw new Error('The chat changed while preparing the diary.');
-        const s = this.h.settings();
-        return this.createJob('diary', [this.inputStep(target ? [target] : [], {
-            kind: 'diary-chat', name, defs, lore, target: M.record(target)?.id, messages,
-            source: this.source(Flow.messageRuns(messages)), date: this.value('diaryDate').trim(), style: this.value('diaryStyle'),
-        })], { flow: { profiles: { diary: s.sideProfile || '' } } });
+    planDiary(name,{defs={},date='',from='',to='',style='',target=null,update=false,rewrite=false,regenerate=false,roster=this.diaryPolicyRoster(),sourceOptions={notes:this.littleThings(),chat:this.h.context().chat||[],sourceId:this.sourceId()}}={}) {
+        const used=update?[...(M.record(target).derivedFrom||[]),...(M.record(target).diaryNoteRefs||[]).map(n=>n.id)]:[];
+        const rows=regenerate?Character.regenerationRows(this.entries,roster,name,target,sourceOptions):Character.diarySelection(this.entries,roster,name,{...sourceOptions,date:date?M.calendarDay(date):'',from,to,used});
+        if(!regenerate&&date&&!M.calendarDay(date))throw new Error('Use a full story date, including year.');
+        if(!rows.length)throw new Error('No matching personal knowledge for this character and period. Extract character knowledge first, or choose a different date/range.');
+        const dates=M.unique(rows.map(x=>x.date)), selectedDate=dates.length===1?dates[0]:'';
+        const req=Character.diaryRequest(name,rows,style,selectedDate,StoryContext.authorBackground(this.h.context(),roster,name,this.diaryStoryContext(roster)));
+        req.system+=StoryContext.settingBlock(this.storyContext());
+        const model=this.h.flowModelInfo?.(this.h.settings().diaryProfile||'');
+        const capacity=this.helperCapacity(Math.min(req.maxTokens,model?.output>0?model.output:req.maxTokens),model);
+        if(M.tokens(req.system+req.prompt)>Math.min(regenerate?Infinity:6000,capacity.input))throw new Error(regenerate?'The saved diary’s full evidence exceeds the selected model’s input capacity. Use a larger-context Diary model or Replace with selected period. Nothing was removed.':'This diary period contains too much evidence. Select a smaller message range or a single story date. No evidence was silently dropped.');
+        return {step:this.inputStep([...rows.filter(x=>!x.note).map(x=>x.e),...(target?[target]:[])],{kind:'diary-evidence',name,style,date:selectedDate,voice:defs.contextType?.startsWith('Matching')?String(defs.personality||'').slice(0,1500):'',moments:rows.map(x=>({id:M.record(x.e).id,date:x.date,unit:x.unit,...(x.note?{note:true,receipt:x.receipt}:{})})),target:M.record(target)?.id,targetHash:target?M.hash(target.content):'',rewrite:rewrite||regenerate,regenerate}),count:rows.length,date:selectedDate};
     }
+
+
+    /** Bulk creation is one ordinary diary step per selected author, never a shared prompt. */
+    bulkDiaryPlans(period) {
+        if(period.date&&!M.calendarDay(period.date))throw new Error('Use a full story date, including year.');
+        const min=period.from===''?0:Number(period.from),max=period.to===''?Infinity:Number(period.to);
+        if(!Number.isInteger(min)||min<0||max<min||(max!==Infinity&&!Number.isInteger(max)))throw new Error('Enter a valid inclusive message range.');
+        const roster=this.diaryPolicyRoster(), policy=this.diaryPolicy(), persona=this.h.context().name1||'';
+        const sourceOptions={notes:this.littleThings(),chat:this.h.context().chat||[],sourceId:this.sourceId()};
+        return this.diaryRoster().map(person=>{
+            const name=person.name, reason=DiaryPolicy.exclusion(policy,roster,persona,name);
+            if(reason)return {name,reason};
+            const names=new Set(DiaryPolicy.identityNames(roster,name).map(Cast.nameKey));
+            const existing=this.entries.some(e=>M.record(e)?.type==='diary'&&M.active(e)&&names.has(Cast.nameKey(M.record(e).subject)));
+            try{return {name,existing,...this.planDiary(name,{...period,roster,sourceOptions,defs:Cast.diaryBackground(this.h.context(),name).defs})};}
+            catch(error){return {name,existing,reason:error.message};}
+        });
+    }
+    async startBulkDiaries() {
+        const origin=this.identity();
+        if(!(await this.h.ensureArchive()))return;
+        await this.refresh();if(origin!==this.identity())throw new Error('Story changed. Reopen bulk diaries.');
+        const archive=this.h.settings().lorebook, profile=this.h.settings().diaryProfile||'';
+        const job=this.liveState().job;if(job&&!['done','canceled'].includes(job.status))throw new Error('Finish or cancel the existing job before creating a diary batch.');
+        const period={date:this.value('diaryDate').trim(),from:this.value('diaryFrom'),to:this.value('diaryTo'),style:this.value('diaryStyle')};
+        const plans=this.bulkDiaryPlans(period), eligible=plans.filter(p=>p.step);
+        if(!eligible.length)throw new Error('No eligible characters have personal evidence for this period. Check the blacklist and period settings.');
+        const root=document.createElement('div');root.className='sa-review';
+        root.innerHTML=`<h3>Bulk diary creation</h3><p>One new diary per selected character. Existing diaries will not be overwritten. Characters with diaries are unchecked initially. Uses the current Diary model and existing rate limiter.</p><p class="sa-hint">Period: ${html([period.date,period.from!==''||period.to!==''?`messages ${period.from||'0'}–${period.to||'latest'}`:''].filter(Boolean).join(' · ')||'Latest available period per character')}. Change the period or style in the diary accordion before opening this dialog.</p><div class="sa-row"><button type="button" class="menu_button" data-bulk-select="missing">Select missing</button><button type="button" class="menu_button" data-bulk-select="all">Select all eligible</button><button type="button" class="menu_button" data-bulk-select="none">Clear selection</button></div><p data-bulk-count role="status"></p><div class="sa-bulk-diary-list">${eligible.map((p,i)=>`<label class="checkbox_label sa-bulk-diary-row"><input type="checkbox" data-bulk-index="${i}" ${p.existing?'':'checked'}><span><b>${html(p.name)}</b><small>${html(p.date||'Undated / multiple dates')} · ${p.count} evidence items${p.existing?' · already has diary':''}</small></span></label>`).join('')}</div>${plans.some(p=>!p.step)?`<details><summary>${plans.filter(p=>!p.step).length} unavailable / excluded</summary>${plans.filter(p=>!p.step).map(p=>`<p class="sa-hint">${html(p.name)} — ${html(p.reason)}</p>`).join('')}</details>`:''}<p class="sa-hint">Review all prepared diaries before saving. A failed request pauses the batch; completed results remain available.</p>`;
+        const inputs=[...root.querySelectorAll('[data-bulk-index]')], count=()=>{root.querySelector('[data-bulk-count]').textContent=`${inputs.filter(i=>i.checked).length} selected · ${inputs.filter(i=>i.checked).length} initial model requests`;};
+        for(const input of inputs)input.addEventListener('change',count);
+        for(const b of root.querySelectorAll('[data-bulk-select]'))b.addEventListener('click',()=>{for(const input of inputs)input.checked=b.dataset.bulkSelect==='all'||b.dataset.bulkSelect==='missing'&&!eligible[Number(input.dataset.bulkIndex)].existing;count();});count();
+        if(!await this.h.confirm(root,{okButton:'Create selected diaries',cancelButton:'Cancel'}))return;
+        const names=inputs.filter(i=>i.checked).map(i=>eligible[Number(i.dataset.bulkIndex)].name);
+        if(!names.length)return;
+        if(origin!==this.identity()||archive!==this.h.settings().lorebook||profile!==(this.h.settings().diaryProfile||''))throw new Error('Story or Diary connection changed. Reopen bulk diaries.');
+        // Replan after approval so a newly blacklisted author or edited source cannot enter the queue.
+        await this.loadBooks();
+        if(origin!==this.identity()||archive!==this.h.settings().lorebook||profile!==(this.h.settings().diaryProfile||''))throw new Error('Story or Diary connection changed. Reopen bulk diaries.');
+        const fresh=new Map(this.bulkDiaryPlans(period).map(p=>[p.name,p]));
+        const steps=names.map(name=>{const p=fresh.get(name),old=eligible.find(x=>x.name===name);if(!p?.step||p.existing!==old.existing||M.hash(p.step)!==M.hash(old.step))throw new Error(`${name}'s eligibility or evidence changed. Reopen bulk diaries.`);return p.step;});
+        return this.createJob('diary',steps,{flow:{profiles:{diary:profile}},diaryBulk:true});
+    }
+    async editDiary() {
+        const name=this.value('diaryName').trim()||this.value('diaryCharacter').trim();
+        const target=this.chosenDiary(name);if(!target)throw new Error('Choose a saved diary first.');
+        const r=M.record(target), origin=this.identity(), archive=this.h.settings().lorebook, id=r.id, world=target.world;
+        if(r.protection?.locked)throw new Error('Unlock this diary in Inspect before editing it.');
+        const original=target.content, base=M.bookHash(this.books[world]);
+        const root=document.createElement('div');root.className='sa-review';
+        root.innerHTML=`<h3>Edit diary — ${html(r.subject)}</h3><p class="sa-hint">Edit the saved Markdown directly. Its author, dates and evidence links remain unchanged; the previous version is retained in revision history. No AI request.</p><label class="sa-field"><span>Diary text</span><textarea class="text_pole" rows="14" data-diary-edit></textarea></label><details><summary>Rendered preview</summary><div class="sa-markdown" data-diary-preview></div></details><label class="sa-field"><span>Correction note (optional)</span><input class="text_pole" data-diary-reason></label>`;
+        const input=root.querySelector('[data-diary-edit]'), preview=root.querySelector('[data-diary-preview]'), details=preview.closest('details');input.value=original;
+        const draw=()=>{if(details.open)preview.innerHTML=markdownPreview(input.value);};input.addEventListener('input',draw);details.addEventListener('toggle',draw);
+        if(!await this.h.confirm(root,{okButton:'Save diary edit',cancelButton:'Cancel'}))return;
+        const content=input.value.trim();if(!content)throw new Error('Diary text cannot be empty.');if(content===original)return;
+        return this.withLock(async()=>{
+            if(origin!==this.identity()||archive!==this.h.settings().lorebook)throw new Error('Story changed. Reopen the diary.');
+            await this.loadBooks();const current=this.find(id);
+            if(origin!==this.identity()||archive!==this.h.settings().lorebook||!current||current.world!==world||M.record(current)?.type!=='diary'||M.record(current).protection?.locked||M.bookHash(this.books[world])!==base)throw new Error('Diary changed or was locked while editing. Reopen it before saving.');
+            const books=M.copy(this.books), item=this.entryIn(books,id);
+            const reason=root.querySelector('[data-diary-reason]').value.trim()||'Manual diary edit';
+            M.revise(item.entry,content,reason,{authorCorrections:[...(M.record(current).authorCorrections||[]),{at:M.now(),text:reason,chat:origin}]});
+            await this.write(books,this.bases(),'Manual diary edit');this.renderDiaryReader();
+        });
+    }
+
+    diaryMessages(entry) {
+        const r = M.record(entry), chat = this.h.context().chat || [], chatId = this.sourceId();
+        const sources = [r.source, ...(r.supplementalSources || [])].filter(source => source?.ranges?.length);
+        if (!sources.length) throw new Error('This diary has no original chat-source receipts to rewrite from. Use Inspect for a manual correction.');
+        const messages = new Map();
+        for (const source of sources) {
+            if (source.chatId && source.chatId !== chatId) throw new Error('Open the diary’s original source chat before rewriting it.');
+            const checked = M.checkSource(source, chatId, chat);
+            if (!checked.valid) throw new Error('One of this diary’s original message ranges changed. Inspect its sources before rewriting.');
+            for (const range of source.ranges) for (const message of M.messageRange(chat, range.from, range.to).messages) messages.set(message.idx, message);
+        }
+        return [...messages.values()].sort((a, b) => a.idx - b.idx);
+    }
+
+    async rewriteDiary() { return this.startDiary(false,true); }
+    async regenerateDiary() { return this.startDiary(false,false,true); }
 
     async condenseDiary() {
         const { name } = this.diaryCharacter();
-        await this.refresh();
-        const entry = this.latestDiary(name);
+        this.assertDiaryAllowed(name);await this.refresh();this.assertDiaryAllowed(name);
+        const entry = this.chosenDiary(name);
         if (!entry) throw new Error('Choose a character with a saved diary.');
-        return this.startCondense([entry], false, true);
+        return this.startCondense([entry], false, true, '', { profile: this.h.settings().diaryProfile || '' });
     }
 
     async startContinuity(claim = '', automatic = false, full = false) {
@@ -1223,9 +1806,11 @@ export class Workbench {
         const profile = flow.profiles[stage] || '';
         const model = this.h.flowModelInfo(profile);
         const measured = req.maxTokens || 6000;
-        const output = model.output > 0 ? model.output : measured;
-        req = { ...req, maxTokens: output, prompt: req.prompt + '\n\n[End of Scene Archivist request]' };
-        if (flow.includeChatContext) req.assembled = await this.h.buildFlowContext(req);
+        const output = stage==='diary'?Math.min(measured,model.output>0?model.output:measured):stage==='memories'?Math.max(measured,4500):model.output > 0 ? model.output : measured;
+        const settingBlock=StoryContext.settingBlock(this.storyContext());
+        const authorBlock=stage==='diary'&&step.payload?.name&&step.payload.kind!=='diary-evidence'?'\n\nAUTHOR IDENTITY (background only):\n'+this.diaryIdentity(step.payload.name):'';
+        req = { ...req, system: req.system+settingBlock+authorBlock, maxTokens: output, ...(stage==='diary'?{includeFinishReason:true,diaryRequest:true}:{}), prompt: req.prompt + '\n\n[End of Scene Archivist request]' };
+        if (flow.includeChatContext && stage!=='diary') req.assembled = await this.h.buildFlowContext(req);
         const inputText = req.assembled ? JSON.stringify(req.assembled) : req.system + '\n' + req.prompt;
         const input = Number(await this.h.tokenCount(inputText)) || M.tokens(inputText);
         if (model.context > 0 && input + output > model.context) {
@@ -1252,7 +1837,7 @@ export class Workbench {
         delete step.oversized;
         if (job.status !== 'running') throw new Error('The job stopped before the next model request.');
         const state = this.liveState(), meter = (state.telemetry ??= { requests: 0, input: 0, output: 0 });
-        const last = meter.last = { label: stage, profile, model: model.name, input, at: M.now(), state: 'requesting' };
+        const last = meter.last = { label: stage, profile, model: model.model || model.name, provider: model.provider || '', maxOutputTokens: output, input, at: M.now(), state: 'requesting' };
         job.requestsTotal = (job.requestsTotal || 0) + 1;
         meter.requests++;
         meter.input += input;
@@ -1263,17 +1848,24 @@ export class Workbench {
             this.h.assert();
             const raw = typeof reply === 'string' ? reply : reply?.content;
             if (reply?.finishReason) last.finishReason = reply.finishReason;
+            if(stage==='diary'&&reply?.reasoningPresent) last.reasoningPresent=true;
+            if(stage==='diary'&&Number.isFinite(reply?.reasoningTokens)) last.reasoningTokens=reply.reasoningTokens;
             if (typeof raw === 'string' && raw.trim()) {
                 last.output = M.tokens(raw);
                 meter.output += last.output;
             }
-            if (req.includeFinishReason && outputLimitReached(last.finishReason)) throw new Flow.IncompleteArchiveError(raw, true);
+            if (req.includeFinishReason && outputLimitReached(last.finishReason)) {
+                if(stage==='diary')throw new Error(`Diary completion reached its ${output}-token reply limit${reply?.reasoningPresent?' (including reasoning tokens)':''} before a complete visible diary was returned. Increase the selected diary connection preset’s output allowance or use a non-reasoning diary model, then retry. No diary was saved.`);
+                throw new Flow.IncompleteArchiveError(raw, true);
+            }
             if (typeof raw !== 'string' || !raw.trim()) throw new Error('The model returned no text.');
             last.state = 'received';
             return raw;
         } catch (error) {
+            if (error?.unsent || error?.cause?.unsent) { meter.requests--; meter.input -= input; job.requestsTotal = Math.max(0, job.requestsTotal - 1); }
             last.state = 'failed';
             last.error = String(error.message || error);
+            if(stage==='diary')Debug.error('DIARY_REQUEST_FAILED','Diary request failed without saving a diary.',{profile,model:last.model,provider:last.provider,inputTokens:input,maxOutputTokens:output,finishReason:last.finishReason,reasoningPresent:last.reasoningPresent,reasoningTokens:last.reasoningTokens,causes:errorDetails(error)});
             if (/context (?:length|window|limit)|too many tokens|input.*too (?:long|large)|maximum context/i.test(last.error)) step.oversized = true;
             throw error;
         } finally {
@@ -1304,8 +1896,10 @@ export class Workbench {
                 step.archiveRetry = Flow.archiveRetry(retry, error.raw);
                 await this.persist();
                 if (retry) {
-                    const next = step.payload.messages?.length > 1 ? ' Use Split this stage to summarize the same messages in smaller parts.' : '';
-                    throw new Error(`${error.message} The shorter attempt also ended early. You can retry with a working connection.${next}`);
+                    const range = `${step.payload.from ?? '?'}-${step.payload.to ?? '?'}`;
+                    const next = step.payload.messages?.length > 1 ? ' Scene Archivist will automatically split only this failing chunk and continue.' : ' This is a single-message chunk, so it cannot be split further.';
+                    Debug.warn('ARCHIVE_CHUNK_TRUNCATED_TWICE', `Archive chunk ${range} ended early twice.`, { range, messages: step.payload.messages?.length || 0, error: error.message });
+                    throw new Error(`${error.message} Archive chunk ${range} ended early twice.${next}`);
                 }
                 this.renderJob();
             }
@@ -1327,6 +1921,7 @@ ${flow.referenceText}` : '';
             const log = Core.currentLogText(archive, this.entries), transcript = Core.buildTranscript(payload.messages);
             const req = Core.buildArchivistRequest(s.prompt, log, transcript, payload, s.unit);
             req.system += '\nUse compact wording and retain distinct story facts, dates, places, order, decisions, consequences, knowledge boundaries and unresolved threads.';
+            if (payload.sceneDate) req.system += `\nACTIVE STORY DATE: ${payload.sceneDate}. This is fictional story chronology, not the real-world date. For events in this selected pass that do not explicitly establish a different date, use ${payload.sceneDate}. Do not label it as a flashback merely because it is earlier than today.`;
             if (archive?.sceneArchivistStory?.shared) {
                 const highest = Core.managedSummary(archive).lastDay;
                 req.system += payload.sharedMode === 'continue'
@@ -1370,7 +1965,7 @@ Start new ${s.unit} entries at ${highest + 1}. Preserve the actual story dates.`
             if (flow.persona) instructions = instructions.replace(/^.*(?:do not|never|exclude|skip).*(?:\{\{user\}\}|the human player).*$/gim, '');
             const system = `${instructions.replaceAll('{{user}}', name)}
 Use the source policy below for this request. ${flow.persona ? `Include ${name} as a character when the evidence supports a memory. Exclude private player commentary.` : `Exclude ${name}, the player persona, from the output.`}
-Write complete natural memories for every relevant character. Keep who witnessed, was told, inferred, or is hiding a fact. References and unrelated chat background never grant knowledge. Preserve explicit author corrections and dates. Omit private OOC chatter.
+Write complete natural memories for every relevant individual character. Only a person or named sentient story character may own a memory. Never a building, object, faction, team, anonymous role or location. Keep who witnessed, was told, inferred, or is hiding a fact. References and unrelated chat background never grant knowledge. Preserve explicit author corrections and dates. Omit private OOC chatter.
 Use [${s.unit} N, full date] when the unit is known, [Date: full date] when only the date is known, or an untagged memory when neither is known. Never invent dates or units.
 Return {"characters":[{"name":"character name","aliases":[],"memories":[{"text":"one dated natural memory","messages":[0],"sourceIds":[],"learnedAt":"","howLearned":"witnessed, told, inferred or rumor"}]}]}. For each memory cite only supporting message indices from the selected CHAT TRANSCRIPT, or sourceIds from the selected ARCHIVE. Use [] when no such source is supplied, never guess an index or source id. These citations do not establish that another character learned the fact. If no memories apply, include "reason" explaining why.`;
             const archiveText = useUnits ? inputs.map(e => `SOURCE ${M.record(e).id}
@@ -1392,7 +1987,7 @@ ${chatText || '(none selected)'}`;
                     source: payload.source, inputs: useUnits ? inputs : [], dateMap, archiveIds: outputIds,
                 }) };
             };
-            const req = { system, prompt, parts: { references: flow.referenceText, log: archiveText, transcript: chatText, system } };
+            const req = { system, prompt, preserveJson:true,maxTokens:6000,parts: { references: flow.referenceText, log: archiveText, transcript: chatText, system } };
             if (prepareOnly) return { req, decode };
             const key = M.hash([req, payload.source]);
             const raw = step.combinedRaw || (step.memoryCacheKey === key && step.memoryRaw) || await this.requestFlow(job, step, req, 'memories');
@@ -1498,12 +2093,38 @@ ${transcript}`;
         return this.withLock(async () => {
             const status = job.status;
             job.status = 'running';
-            try { return await new BulkRun(this, job).finish(job.cursor < job.steps.length); }
+            try {
+                const complete = await new BulkRun(this, job).finish(job.cursor < job.steps.length);
+                if (complete && job.cursor === job.steps.length) {
+                    job.status = 'done'; delete job.draft; delete job.auditParts; delete job.reviewEdits;
+                    for (const step of job.steps) for (const key of ['output','combinedRaw','memoryRaw','memoryCacheKey','memoryAudit','condenseDraft']) delete step[key];
+                }
+                return complete;
+            }
             finally {
                 if (job.status === 'running') job.status = status;
                 await this.persist(); this.renderJob();
             }
         });
+    }
+
+    async chooseExtractionConnection() {
+        const job = this.liveState().job;
+        if (!job || job.steps[job.cursor]?.payload.kind !== 'extract' || this.queue.running) return;
+        const root = document.createElement('div'); root.className = 'sa-review';
+        root.innerHTML = '<h3>Extraction connection</h3><p>Choose the connection for the remaining structured extraction. Existing results and archive profiles are unchanged. This does not send a request.</p>';
+        const select = document.createElement('select'); select.className = 'text_pole';
+        const add = (value, label) => { const option = document.createElement('option'); option.value = value; option.textContent = label; select.append(option); };
+        add('', 'Current SillyTavern model');
+        for (const p of this.baseHost.context().extensionSettings?.connectionManager?.profiles || []) add(p.id, `${p.name} · ${p.model || 'provider-selected model'}`);
+        const selected = this.extractionProfile();
+        if (selected && !Array.from(select.options).some(o => o.value === selected)) add(selected, 'Saved profile unavailable');
+        select.value = selected; root.append(select);
+        if (!(await this.baseHost.confirm(root, { okButton: 'Save connection' })) || this.liveState().job !== job || this.queue.running) return;
+        this.baseHost.flowModelInfo(select.value);
+        this.baseHost.settings().sideProfile = select.value;
+        this.baseHost.saveSettings(); this.baseHost.rebindSettings?.();
+        await this.persist(); this.renderJob(); this.renderFlow();
     }
 
     async retryFlow({ useCurrent = false, refreshEvidence = false } = {}) {
@@ -1553,6 +2174,85 @@ ${transcript}`;
         return this.withLock(() => this.queue.resume());
     }
 
+    splitArchiveStep(job, step) {
+        const payload = step?.payload;
+        if (!job?.options.flow || payload?.kind !== 'archive' || !Array.isArray(payload.messages) || payload.messages.length <= 1) return false;
+        const parts = Flow.halve(payload.messages);
+        if (!parts) return false;
+        const replacements = parts.map(items => {
+            const next = { ...M.copy(payload), messages: items, from: items[0].idx, to: items.at(-1).idx, source: this.source(Flow.messageRuns(items)) };
+            return { id: M.uid(), payload: next, status: 'pending' };
+        });
+        job.steps.splice(job.cursor, 1, ...replacements);
+        job.status = 'paused';
+        delete job.error;
+        Debug.warn('ARCHIVE_CHUNK_AUTO_SPLIT', `Archive messages ${payload.from}-${payload.to} failed after the compact retry; split into ${replacements.map(r => `${r.payload.from}-${r.payload.to}`).join(' and ')}.`, { from: payload.from, to: payload.to, parts: replacements.map(r => [r.payload.from, r.payload.to]) });
+        return true;
+    }
+
+    async resumeWithAutoSplit() {
+        let job;
+        const initialStages = Math.max(1, Number(this.liveState().job?.steps?.length || 1));
+        // Recovery can legitimately expand a long job as malformed extraction fragments are halved.
+        // Scale the loop guard with the job instead of imposing a fixed ceiling below the stage count.
+        const recoveryLimit = Math.max(128, Math.min(8192, initialStages * 64 + 64));
+        for (let guard = 0; guard < recoveryLimit; guard++) {
+            // Recover a previously failed extraction BEFORE sending another model request.
+            // This is important when the saved job already knows the reply was truncated.
+            job = this.liveState().job;
+            if (job?.status === 'failed') {
+                const failed = job.steps?.[job.cursor];
+                if (await this.splitFailedExtraction(job, failed)) {
+                    await this.persist();
+                    this.h.notify('Recovered the failed structured batch by splitting only that evidence. Completed scenes and results are retained; continuing automatically.', 'info');
+                    continue;
+                }
+                if (await this.deferFailedExtraction(job, failed)) {
+                    await this.persist();
+                    this.h.notify('One tiny structured-extraction fragment kept returning malformed output. It was deferred so the archive can continue; the source scene itself is still intact.', 'warning');
+                    continue;
+                }
+            }
+
+            job = await this.queue.resume();
+            if (!job || job.status !== 'failed') {
+                if (job?.status === 'done') {
+                    await this.syncExtractionGaps(job);
+                    this.renderJob();
+                    if (job.extractionGaps?.length && !job.extractionGapNotice) {
+                        job.extractionGapNotice = true;
+                        await this.persist();
+                        this.h.notify(`Archive completed with ${job.extractionGaps.length} deferred structured-extraction gap${job.extractionGaps.length === 1 ? '' : 's'}. The source scenes remain intact and searchable; you can retry only those gaps later.`, 'warning');
+                    }
+                }
+                return job;
+            }
+            const step = job.steps?.[job.cursor];
+            if (await this.splitFailedExtraction(job, step)) {
+                await this.persist();
+                this.h.notify('Recovered a malformed structured reply by splitting only that batch. Completed scenes and results are retained; continuing automatically.', 'info');
+                continue;
+            }
+            if (await this.deferFailedExtraction(job, step)) {
+                await this.persist();
+                this.h.notify('One tiny structured-extraction fragment could not be repaired or split further. It was deferred and the rest of the archive is continuing.', 'warning');
+                continue;
+            }
+            if (!step?.archiveRetry || !this.splitArchiveStep(job, step)) {
+                if (step?.payload?.kind === 'archive' && step?.archiveRetry && step?.payload?.messages?.length === 1) {
+                    Debug.error('ARCHIVE_SINGLE_MESSAGE_FAILED', `Archive message ${step.payload.from} failed even after the compact retry and cannot be split further.`, { message: step.payload.from, error: job.error });
+                } else {
+                    Debug.error('JOB_FAILED', `${job.kind} job failed at stage ${job.cursor + 1} of ${job.steps.length}.`, { kind: job.kind, stage: job.cursor + 1, totalStages: job.steps.length, payloadKind: step?.payload?.kind || '', range: step?.payload?.from != null ? [step.payload.from, step.payload.to] : null, error: job.error });
+                }
+                return job;
+            }
+            await this.persist();
+            this.h.notify('One archive chunk kept truncating, so Scene Archivist split only that chunk and is continuing automatically.', 'warning');
+        }
+        if (job) { job.status = 'failed'; job.error = `Automatic recovery exceeded its ${recoveryLimit}-event safety limit. Open the debug log for the exact failing ranges.`; await this.persist(); }
+        return job;
+    }
+
     async splitFlowStage() {
         const job = this.state().job, step = job?.steps[job.cursor];
         if (!job?.options.flow || this.queue.running || !['failed', 'paused'].includes(job.status) || !(step?.oversized || step?.archiveRetry)) return;
@@ -1562,17 +2262,18 @@ ${transcript}`;
         if (!parts) throw new Error('This stage contains one indivisible item. Choose a model with more context or shorten its input.');
         if (!(await this.h.confirmText('Split only this stage into two requests? Finished results are retained.', { okButton: 'Split stage' }))) return;
         if (this.liveState().job !== job || job.steps[job.cursor] !== step || this.queue.running || !['failed', 'paused'].includes(job.status)) return;
-        const replacements = parts.map(items => {
-            const next = { ...M.copy(payload), [key]: items };
-            if (key === 'messages') Object.assign(next, { from: items[0].idx, to: items.at(-1).idx, source: this.source(Flow.messageRuns(items)) });
-            if (key === 'ids') next.allUnits = false;
-            return { id: M.uid(), payload: next, status: 'pending' };
-        });
-        job.steps.splice(job.cursor, 1, ...replacements);
-        job.status = 'paused';
-        delete job.error;
+        if (payload.kind === 'archive' && key === 'messages') this.splitArchiveStep(job, step);
+        else {
+            const replacements = parts.map(items => {
+                const next = { ...M.copy(payload), [key]: items };
+                if (key === 'messages') Object.assign(next, { from: items[0].idx, to: items.at(-1).idx, source: this.source(Flow.messageRuns(items)) });
+                if (key === 'ids') next.allUnits = false;
+                return { id: M.uid(), payload: next, status: 'pending' };
+            });
+            job.steps.splice(job.cursor, 1, ...replacements); job.status = 'paused'; delete job.error;
+        }
         await this.persist();
-        return this.withLock(() => this.queue.resume());
+        return this.withLock(() => this.resumeWithAutoSplit());
     }
 
     async condensationRetryRequest(step, request, transport) {
@@ -1694,6 +2395,8 @@ ${transcript}`;
             Object.assign(step.payload, { ids, hashes: Object.fromEntries(inputs.map(e => [M.record(e).id, M.hash(e.content)])), targetHash: M.hash(target.content) }); await this.persist();
         }
         const kind = step.payload.kind || job.kind;
+        if(kind.startsWith('diary'))this.assertDiaryAllowed(step.payload.name);
+        if(kind==='condense'||kind==='rebuild')this.assertDiaryJob(job);
         if (job.options.flow && ['archive', 'memories', 'tracker-pass'].includes(kind)) {
             if (job.options.flow.singleRequest && job.cursor === 0 && !step.combinedRaw) {
                 try { await this.prepareCombined(job, step); }
@@ -1756,6 +2459,7 @@ ${transcript}`;
             const archivePrompt = job.options.mode === 'recap' ? M.recapWritingPrompt(settings) : settings.archiveCondensePrompt;
             const req = M.condensationRequest(inputs, job.options.mode, job.options.label, job.options.target,
                 memories.length === inputs.length ? memoryPrompt : archivePrompt);
+            if (step.payload.scheduledPeriod) { const {from,through,part,parts}=step.payload.scheduledPeriod; req.system += `\nScheduled fictional calendar period: ${from} through ${through}, inclusive.${parts ? ` Recap part ${part} of ${parts}; summarize only this part’s supplied scenes.` : ""} Use only the supplied scenes; a scene spanning the boundary is kept intact and filed by its end date. Do not invent events for gaps.`; }
             if (memories.length && memories.length < inputs.length) {
                 req.system += `\nFor these character memory IDs, use the separate writing instructions below: ${memories.map(e => M.record(e).id).join(', ')}.\n${memoryPrompt}`;
             }
@@ -1811,7 +2515,7 @@ ${transcript}`;
             }
             return { results: result, notes, ...(audit ? { audit } : {}) };
         }
-        if (kind === 'extract') return this.json({ ...M.extractionRequest(inputs, this.h.context().name1), maxTokens: 6000 }, raw => M.extractionResult(raw, inputs), 'structured memories');
+        if (kind === 'extract') return this.extractStructured(job, step, inputs);
         if (kind === 'continuity') return this.json({ ...M.continuityRequest(step.payload.claim, inputs), maxTokens: 4000 }, raw => M.continuityResult(raw, inputs), 'continuity check');
         if (kind === 'memories') {
             const s = this.h.settings(), dateMap = Object.fromEntries(inputs.filter(e => M.record(e).unit?.number != null).map(e => [M.record(e).unit.number, (M.record(e).dates || []).join('; ')]));
@@ -1864,12 +2568,30 @@ ${transcript}`;
                 return audits.map(a => ({ id: a.id, ...this.organizedMemory(JSON.stringify(chars.find(c => c.id === a.id)), a.bullets, names.get(a.id), sources.get(a.id)) }));
             }, 'organize character memory batch');
         }
+        if (kind === 'diary-evidence') {
+            const p=step.payload, byId=new Map(Character.characterSources(this.entries,this.diaryPolicyRoster(),p.name).filter(e=>inputs.includes(e)).map(e=>[M.record(e).id,e]));
+            const notes=new Map(Character.diaryNotes(this.entries,this.diaryPolicyRoster(),p.name,this.littleThings(),this.h.context().chat||[],this.sourceId()).map(x=>[x.note.id,x]));
+            const rows=p.moments.map(x=>x.note?{...x,e:notes.get(x.id)?.receipt===x.receipt?notes.get(x.id).e:null}:{...x,e:byId.get(x.id)});
+            if(rows.some(x=>!x.e||M.record(x.e).type!=='knowledge'||M.record(x.e).knowledge==='unaware'||!M.active(x.e)))throw new Error('Personal evidence changed. Select the diary period again.');
+            const req=Character.diaryRequest(p.name,rows,p.style,p.date,this.diaryIdentity(p.name));
+            const content=await this.requestFlow(job,step,req,'diary');if(!String(content||'').trim())throw new Error('Diary returned empty prose.');return {content};
+        }
+        if (kind === 'diary-rewrite') {
+            const p = step.payload, target = inputs[0];
+            if (!target || M.record(target).id !== p.target || M.hash(target.content) !== p.targetHash) throw new Error('The diary changed before its rewrite could run. Start the rewrite again from the current diary.');
+            if (!M.checkSource(p.source, this.sourceId(), this.h.context().chat || []).valid) throw new Error('The diary’s source messages changed before this rewrite could run. Inspect its sources first.');
+            const system = 'Rewrite one fictional private diary as a complete first-person entry in the selected character’s voice. ORIGINAL CHAT MESSAGES are the event evidence. The selected diary author is the named individual, not the card or outer transcript speaker. Shared ensemble definitions and attached lore are background only; infer this individual’s voice from their own actions and dialogue. Background sources do not grant knowledge of secrets the character never learned. Preserve uncertainty, false beliefs, omissions, and what the character personally witnessed or was told. Do not invent events, dates, awareness, or private information. Do not treat the previous diary prose as evidence. Return only the complete replacement diary body, without a Diary heading or commentary. Use full story dates when supported and leave dates unknown when the evidence does not establish them. ' + (p.style || '');
+            const prompt = 'DIARY AUTHOR: ' + p.name + '\nOPTIONAL STORY / CHARACTER BACKGROUND\n' + JSON.stringify(p.defs) + '\n\nATTACHED BACKGROUND LORE\n' + (p.lore || '(none)') +
+                '\n\nORIGINAL CHAT MESSAGES\n' + Core.buildTranscript(p.messages) +
+                '\n\nRequested story date: ' + (p.date || 'Use the date in the evidence, if known.') + '\n\nRewrite the complete diary entry from these sources.';
+            return { content: await this.requestFlow(job, step, { system, prompt, maxTokens: 3500 }, 'diary') };
+        }
         if (kind === 'diary-chat') {
             const p = step.payload;
             if (!M.checkSource(p.source, this.sourceId(), this.h.context().chat || []).valid) throw new Error('The selected messages changed before this stage could run. Refresh this stage from chat.');
             const previous = p.target ? inputs[0]?.content || '' : '';
-            const system = 'Write a fictional private diary in the selected character’s first-person voice. Use the original chat as the event evidence. Use the card and attached lore for background and voice. Preserve what they personally witnessed or learned, including uncertainty. Keep private player notes and other characters’ secrets out of the diary. Write only new diary text. Use a full story date when supported, and keep the date unknown if the scene supplies none. ' + (p.style || '');
-            const prompt = 'CHARACTER CARD\n' + JSON.stringify(p.defs) + '\n\nATTACHED BACKGROUND LORE\n' + (p.lore || '(none)') +
+            const system = 'Write a fictional private diary in the selected character’s first-person voice. Use the original chat as the event evidence. The selected diary author is the named individual, not the card or outer transcript speaker. Infer their own voice from their dialogue and behavior; shared ensemble definitions and attached lore are background only. Preserve what they personally witnessed or learned, including uncertainty. Keep private player notes and other characters’ secrets out of the diary. Write only new diary text. Use a full story date when supported, and keep the date unknown if the scene supplies none. ' + (p.style || '');
+            const prompt = 'DIARY AUTHOR: ' + p.name + '\nOPTIONAL STORY / CHARACTER BACKGROUND\n' + JSON.stringify(p.defs) + '\n\nATTACHED BACKGROUND LORE\n' + (p.lore || '(none)') +
                 '\n\nPREVIOUS DIARY FOR CONTINUITY\n' + (previous || '(none)') + '\n\nORIGINAL CHAT MESSAGES\n' + Core.buildTranscript(p.messages) +
                 '\n\nRequested story date: ' + (p.date || 'Use the date in the evidence, if known.');
             return { content: await this.requestFlow(job, step, { system, prompt, maxTokens: 2500 }, 'diary') };
@@ -1887,6 +2609,8 @@ ${transcript}`;
         await this.loadBooks(); this.h.assert();
         if (job.options.archive && job.options.archive !== this.h.settings().lorebook) throw new Error('Select this job’s original archive before resuming it.');
         const kind = step.payload.kind || job.kind;
+        if(kind.startsWith('diary'))this.assertDiaryAllowed(step.payload.name);
+        if(kind==='condense'||kind==='rebuild')this.assertDiaryJob(job);
         if (!this.bulkRun && job.pendingWrite?.stepId === step.id) return this.finishStepWrite(job.pendingWrite);
         if (this.state().applied?.includes(step.id)) return true;
         const archiveBook = this.h.settings().lorebook;
@@ -1901,7 +2625,7 @@ ${transcript}`;
             if (!this.bulkRun && !M.checkSource(step.payload.source, this.sourceId(), this.h.context().chat || []).valid) throw new Error('The selected transcript changed while the result was waiting for review.');
             const placement = job.options.flow ? { mode: step.payload.sharedMode, number: step.payload.sharedUnit, unit: this.h.settings().unit } : null;
             const accept = () => this.bulkRun
-                ? this.bulkRun.acceptArchive(step.output.raw, step.payload.source, step.id, placement, !!(job.options.flow?.singleRequest && step.combinedRaw))
+                ? this.bulkRun.acceptArchive(step.output.raw, step.payload.source, step.id, placement, !!(job.options.flow?.singleRequest && step.combinedRaw), step.payload.sceneDate || '')
                 : this.h.acceptArchive(step.output.raw, step.payload.source, step.id);
             let res;
             try { res = await accept(); }
@@ -1923,6 +2647,7 @@ ${transcript}`;
             }
             if (!res) return false;
             await this.h.afterArchive({ from: step.payload.from, to: step.payload.to, ranges: step.payload.source?.ranges, source: step.payload.source, stepId: step.id, ids: res.ids }, res.days, job.options.hide, res.archiveIds);
+            Debug.info('ARCHIVE_CHUNK_SAVED', `Saved archive messages ${step.payload.from}-${step.payload.to}.`, { from: step.payload.from, to: step.payload.to, recordIds: res.ids, storyDate: step.payload.sceneDate || '' });
             const data = await this.h.load(archiveBook); data.sceneArchivistReceipts = M.unique([...(data.sceneArchivistReceipts ?? []), step.id]); await this.h.save(archiveBook, data);
             this.state().applied = M.unique([...(this.state().applied ?? []), step.id]); await this.persist(); return true;
         }
@@ -2000,7 +2725,7 @@ ${update.content}`;
                 const levels = inputs.map(e => Number(M.record(e).level) || 0);
                 const recap = this.add(books, 'recap', changes[0].content, { covers: inputs.map(e => M.record(e).id), derivedFrom: inputs.map(e => M.record(e).id), level: Math.max(...levels) + 1,
                     dates: M.unique(inputs.flatMap(e => M.record(e).dates || [])), people: M.unique(inputs.flatMap(e => M.record(e).people || [])), locations: M.unique(inputs.flatMap(e => M.record(e).locations || [])),
-                    source: this.source([]) }, true);
+                    source: this.source([]), ...(step.payload.scheduledPeriod ? {scheduledPeriod: M.copy(step.payload.scheduledPeriod)} : {}) }, true);
                 Core.placeRecap(books[archiveBook], recap, this.h.options());
                 if (this.bulkRun) (this.bulkRun.data.metrics ??= {})[M.record(recap).id] = {
                     beforeTokens: changes[0].beforeTokens, afterTokens: changes[0].afterTokens, stepId: step.id,
@@ -2011,11 +2736,25 @@ ${update.content}`;
         if (kind === 'extract') {
             const changes = step.output.map((r, i) => ({ id: i, title: `${r.type}: ${r.subject || r.body.slice(0, 50)}`, content: r.type === 'knowledge' ? M.knowledgeText(r, r.body) : `## ► ${r.type === 'fact' ? 'Fact' : 'Thread'} — ${r.subject || r.body.slice(0, 50)}\n\n[${r.dates.join('; ') || 'Unknown Date'}]\n- ${r.body}${r.due ? '\n- Deadline: ' + r.due : ''}` }));
             if (!changes.length) return this.h.confirmText('The model found no meaningful structured facts in these sources. Mark this extraction step reviewed?');
+            const originalContent=new Map(changes.map(c=>[c.id,c.content]));
+            for(const c of changes){const profiles=step.output[c.id].scannedDiaryAuthors;if(Array.isArray(profiles)&&profiles.length)c.evidence=profiles.filter(a=>a&&typeof a.name==='string'&&typeof a.text==='string').map(a=>`Diary author guidance — ${a.name}: ${a.text}`).join('\n');}
             if (!(await this.review(changes, 'Review facts and character knowledge'))) return false;
+            const roster=this.diaryPolicyRoster();
             for (const change of changes) {
-                const extra = step.output[change.id];
-                if (Object.values(books).flatMap(book => Object.values(book.entries ?? {})).some(e => M.record(e)?.type === extra.type && M.record(e)?.subject === extra.subject && M.record(e)?.body === extra.body && M.record(e)?.status === extra.status)) continue;
-                this.add(books, extra.type, change.content, extra, ['fact', 'thread'].includes(extra.type));
+                const {scannedDiaryAuthors,...extra} = step.output[change.id];
+                const duplicate=Object.values(books).flatMap(book => Object.values(book.entries ?? {})).find(e => M.record(e)?.type === extra.type && M.record(e)?.subject === extra.subject && M.record(e)?.body === extra.body && M.record(e)?.status === extra.status);
+                const entry=duplicate||this.add(books, extra.type, change.content, extra, false);
+                if(change.content===originalContent.get(change.id)&&(!duplicate||duplicate.content===change.content)){
+                    // Metadata-only updates on repeated scans are safe only if the
+                    // existing record already cites exactly the original evidence.
+                    // Never mutate protected records or revive a stale carrier.
+                    try{
+                        // Resume older db.36 outputs only when their queued source
+                        // hashes are still pinned. No new model call is required.
+                        const profiles=Array.isArray(scannedDiaryAuthors)?scannedDiaryAuthors.map(p=>p?.sourceHashes?p:{...p,sourceHashes:Object.fromEntries((Array.isArray(p?.sourceIds)?p.sourceIds:[]).filter(id=>Object.hasOwn(step.payload.hashes||{},id)).map(id=>[id,step.payload.hashes[id]]))}):[];
+                        ScannedAuthors.storeProfiles(entry,profiles,this.entries,roster);
+                    }catch(error){Debug.warn('DIARY_PROFILE_METADATA_SKIPPED','Optional author guidance could not be saved: '+String(error?.message||error));}
+                }
             }
             await this.write(books, bases, 'Structured continuity extraction', step.id); return true;
         }
@@ -2053,6 +2792,38 @@ ${update.content}`;
 
             await this.write(books, bases, 'Memory audit batch', step.id); return true;
         }
+        if (kind === 'diary-evidence') {
+            const p=step.payload,target=p.target?this.entryIn(books,p.target).entry:null;
+            const known=new Set(Character.characterSources(this.entries,this.diaryPolicyRoster(),p.name).filter(e=>M.record(e).knowledge!=='unaware').map(e=>M.record(e).id));
+            if(p.moments.some(x=>!x.note&&!known.has(x.id)))throw new Error('Personal evidence changed while the diary was pending.');
+            if(p.target&&!target)throw new Error('The selected diary no longer exists.');
+            if(target&&(M.hash(target.content)!==p.targetHash||['locked','exact','detailed'].some(flag=>M.record(target).protection?.[flag])))throw new Error('The diary changed while the result was pending.');
+            const body=String(step.output.content||'').trim().replace(/^(?:#{1,3}\s*)?(?:►\s*)?Diary\s*[—–:-].*\n+/i,'');if(!body)throw new Error('Diary returned empty prose.');
+            const content=(target&&!p.rewrite?target.content.trim():`## ► Diary — ${p.name}`)+'\n\n'+(p.date?`### ${p.date}\n\n`:'')+body;
+            const ids=M.unique([...(target&&!p.rewrite?M.record(target).derivedFrom||[]:[]),...p.moments.filter(x=>!x.note).map(x=>x.id)]);
+            const notes=new Map(Character.diaryNotes(this.entries,this.diaryPolicyRoster(),p.name,this.littleThings(),this.h.context().chat||[],this.sourceId()).map(x=>[x.note.id,x]));
+            const refs=p.moments.filter(x=>x.note).map(x=>{const n=notes.get(x.id);if(n?.receipt!==x.receipt)throw new Error('A diary detail changed while review was pending.');return {id:x.id,hash:x.receipt,source:n.note.source};});
+            const diaryNoteRefs=[...(target&&!p.rewrite?M.record(target).diaryNoteRefs||[]:[]),...refs];
+            const supplementalSources=[...(target&&!p.rewrite?M.record(target).supplementalSources||[]:[]),...refs.map(x=>x.source)];
+            const changes=[{title:p.name+' · diary',before:target?.content||'',content}];
+            if(!(await this.review(changes,p.regenerate?'Review regenerated diary':'Review character diary','Creative, subjective prose. Source-linked personal knowledge only; never injected as canon. The previous diary remains in revision history.')))return false;
+            this.assertDiaryAllowed(p.name);
+            if(target) M.revise(target,changes[0].content,p.regenerate?'Regenerate diary from saved personal evidence':'Personal-evidence diary',{dates:p.regenerate?M.unique(p.moments.map(x=>x.date)):p.rewrite?(p.date?[p.date]:[]):M.unique([...(M.record(target).dates||[]),p.date]),derivedFrom:ids,derivedHashes:Object.fromEntries(ids.map(id=>[id,M.hash(this.find(id)?.content||'')])),diaryNoteRefs,supplementalSources,creative:true});
+            else this.add(books,'diary',changes[0].content,{subject:p.name,dates:p.date?[p.date]:[],derivedFrom:ids,diaryNoteRefs,supplementalSources,creative:true});
+            await this.write(books,bases,'Save personal-evidence diary',step.id);return true;
+        }
+        if (kind === 'diary-rewrite') {
+            const p = step.payload, target = this.entryIn(books, p.target).entry;
+            const r = M.record(target);
+            if (M.hash(target.content) !== p.targetHash || ['locked', 'exact', 'detailed'].some(flag => r.protection?.[flag])) throw new Error('The diary changed or was protected while this rewrite was pending. Start it again from the current diary.');
+            const body = step.output.content.trim().replace(/^(?:#{1,3}\s*)?(?:►\s*)?Diary\s*[—–:-].*\n+/i, '');
+            if (!body) throw new Error('The diary rewrite was empty.');
+            const content = `## ► Diary — ${p.name}\n\n${body}`;
+            const changes = [{ title: `${p.name}'s diary`, before: target.content, content }];
+            if (!(await this.review(changes, 'Review diary rewrite', 'This replaces the diary prose from its verified original chat sources. The previous diary remains in revision history.'))) return false;
+            M.revise(target, changes[0].content, 'Rewrite diary from original chat sources', { ...M.chronology(changes[0].content), creative: true });
+            await this.write(books, bases, 'Rewrite diary', step.id); return true;
+        }
         if (kind === 'diary-chat') {
             const p = step.payload;
             const target = p.target ? this.entryIn(books, p.target).entry : null;
@@ -2085,7 +2856,8 @@ ${update.content}`;
 
     async commitMemories(job, step, inputs) {
         const s = this.h.settings(), result = step.output, personaName = String(this.h.context().name1 || '').toLocaleLowerCase();
-        const chars = result.chars.filter(c => job.options?.flow?.persona || ![c.name, ...c.aliases].some(name => name.toLocaleLowerCase() === personaName));
+        const chars = result.chars.filter(c => Cast.usableName(c.name) && (job.options?.flow?.persona || ![c.name, ...c.aliases].some(name => name.toLocaleLowerCase() === personaName)));
+        if(result.chars.some(c=>!Cast.usableName(c.name))) throw new Error('The response contained an invalid character name; no memory coverage was advanced. Retry this stage.');
         const direct = job.options?.flow ? step.payload.source : null;
         const evidence = direct?.ranges?.length ? direct : null;
         const skipped = new Set(), added = [];
@@ -2150,7 +2922,7 @@ ${update.content}`;
             } else {
                 const e = this.h.makeEntry(c.book, data);
                 const o = this.h.options();
-                Object.assign(e, { content: c.content, comment: `🧠| Memories · ${p.name}`, key: p.keys, keysecondary: [], constant: s.memoryTarget === 'character', position: ({ outlet: 7, before: 0, after: 1, depth: 4 })[o.delivery] ?? 4, outletName: o.delivery === 'outlet' ? o.outlet : '', depth: o.depth, role: o.role, ignoreBudget: true, disable: false, order: 5000, excludeRecursion: true, preventRecursion: true, selective: true, probability: 100 });
+                Object.assign(e, { content: c.content, comment: `🧠| Memories · ${p.name}`, key: p.keys, keysecondary: [], constant: s.databaseOnly ? false : s.memoryTarget === 'character', position: ({ outlet: 7, before: 0, after: 1, depth: 4 })[o.delivery] ?? 4, outletName: o.delivery === 'outlet' ? o.outlet : '', depth: o.depth, role: o.role, ignoreBudget: true, disable: false, order: 5000, excludeRecursion: true, preventRecursion: true, selective: true, probability: 100 });
                 e.sceneArchivist = M.makeRecord(e, { storyId: this.state().storyId, type: 'memory', source: evidence || this.source([]) }, { subject: p.name, subjectAvatar, aliases: p.aliases, derivedFrom: inputs.map(e => M.record(e).id), derivedHashes: Object.fromEntries(inputs.map(e => [M.record(e).id, M.hash(e.content)])) });
                 added.push(M.record(e).id);
             }
@@ -2197,7 +2969,7 @@ ${update.content}`;
 
     async beforeGeneration(type, params, dryRun) {
         if (this.helperDepth) return; // Nested quiet helpers cannot replace the main reply's scan.
-        this.installVectorBridge();
+        if (!this.h.settings().databaseOnly) this.installVectorBridge();
         if (dryRun || this.h.isBusy() || type === 'quiet' || params?.quiet_prompt || !this.h.isActive()) {
             this.sceneRecall.finish();
             this.scanSuppressed = true;
@@ -2251,7 +3023,7 @@ ${update.content}`;
                 if (row.excerpt) this.recallDetails.set(id, [...(this.recallDetails.get(id) || []), row]);
             }
             const info = globalThis.document?.querySelector('#sa_recall_last'); if (info) info.textContent = `Recall selected ${chosen.length} evidence items, subject to native rules and the shared memory budget.`;
-        } catch (e) { console.warn('[Scene Archivist] Recall failed; native World Info rules remain in use:', e); }
+        } catch (e) { Debug.warn('RECALL_FAILED', 'Scene recall failed; native World Info rules remain in use.', e); }
         finally { if (epoch === this.generationEpoch && origin === this.identity()) this.scanSuppressed = false; }
     }
     recentText(type = this.sceneRecall.run?.type, pending = '') {
@@ -2261,6 +3033,7 @@ ${update.content}`;
     }
 
     installVectorBridge() {
+        if(this.h.settings().databaseOnly)return;
         const original = globalThis.vectors_rearrangeChat;
         if (typeof original !== 'function' || original.sceneArchivistWrapped) return;
         const self = this;
@@ -2406,7 +3179,7 @@ ${update.content}`;
         }
         const epoch = this.generationEpoch;
         try { await this.sceneRecall.prepare(unique, group, excluded); }
-        catch (error) { console.warn('[Scene Archivist] Could not prepare scene recall:', error); }
+        catch (error) { Debug.warn('RECALL_PREPARE_FAILED', 'Could not prepare scene recall.', error); }
         if (epoch !== this.generationEpoch || this.scanSuppressed) return;
         const time = this.sceneRecall.restriction();
         for (const e of managed) if (time(e)) e.disable = true;
@@ -2474,7 +3247,7 @@ ${update.content}`;
         const root = document.createElement('div'); root.className = 'sa-review';
         root.innerHTML = `<h3>Restore a complete story</h3><p>${names.length} books, ${Object.values(bundle.books).reduce((n, d) => n + Object.keys(d.entries).length, 0)} entries. Existing books remain available. The restored archive will be private and selected for this chat. Unfinished imported drafts are preserved in backup metadata; they are not replayed against renamed books.</p><pre></pre><label class="checkbox_label"><input type="checkbox" data-import-settings><span>Also apply the saved workflow settings</span></label>`;
         root.querySelector('pre').textContent = Object.entries(mapping).map(([a, b]) => `${a} → ${b}`).join('\n');
-        if (!(await this.h.confirm(root, { okButton: 'Create restored books' }))) return;
+        if (!(await this.h.confirm(root, { okButton: 'Create restored database' }))) return;
         await this.withLock(async () => {
             const newId = M.uid(), newSource = M.uid(), dataBooks = M.copy(bundle.books);
             const importedState = bundle.metadata?.workbench || {}, originalSource = importedState.sourceId || importedState.storyId;
@@ -2483,13 +3256,18 @@ ${update.content}`;
                 for (const e of Object.values(data.entries)) {
                     e.sceneArchivistArchive = mapping[oldArchive]; const r = M.record(e); if (!r) continue;
                     r.storyId = newId;
-                    const source = r.source || { ranges: [] };
-                    const matches = (source.ranges || []).every(range => (range.messages || []).every(m => this.h.context().chat?.[m.index] && M.messageHash(this.h.context().chat[m.index]) === m.hash));
-                    if (matches && source.chatId === originalSource) {
-                        ownRanges.push(...(source.ranges || []));
-                        Object.assign(source, { chatId: newSource, actualChatId: this.identity(), label: String(this.h.context().chatId || '') });
-                    }
-                    r.source = source;
+                    const remapSource = source => {
+                        if(!source || source.chatId!==originalSource) return source;
+                        const matches=(source.ranges||[]).every(range=>(range.messages||[]).length>0&&(range.messages||[]).every(m=>this.h.context().chat?.[m.index]&&M.messageHash(this.h.context().chat[m.index])===m.hash));
+                        if(matches){ownRanges.push(...(source.ranges||[]));Object.assign(source,{chatId:newSource,actualChatId:this.identity(),label:String(this.h.context().chatId||'')});}
+                        return source;
+                    };
+                    r.source=remapSource(r.source||{ranges:[]});
+                    // Restore per-bullet source receipts as well as top-level ones;
+                    // otherwise valid repaired memory links point to the old chat ID.
+                    for(const item of r.memoryEvidence||[])if(item.source)remapSource(item.source);
+                    for(const source of r.supplementalSources||[])remapSource(source);
+                    for(const item of r.diaryNoteRefs||[])if(item.source)remapSource(item.source);
                 }
                 if (data.sceneArchivistStory) {
                     const notes = Little.littleThings(data);
@@ -2506,6 +3284,12 @@ ${update.content}`;
             for (const name of Object.values(mapping)) this.h.register(s.lorebook, name, name === s.lorebook ? 'archive' : 'separate');
             const state = this.state(); state.storyId = newId; state.sourceId = newSource; delete state.sharedArchive; state.originChat = this.identity(); state.restoredFrom = bundle.created;
             state.findings = M.copy(bundle.metadata?.workbench?.findings || []); state.applied = [];
+            const restoredPolicy=DiaryPolicy.policyFor(importedState,oldArchive);
+            DiaryPolicy.savePolicy(state,{...restoredPolicy,archive:s.lorebook});
+            StoryContext.saveStoryContext(state,{...StoryContext.storyContext(importedState,oldArchive),archive:s.lorebook});
+            const restoredGaps = importedState.extractionGaps || (importedState.job?.status === 'done' ? importedState.job?.extractionGaps : null);
+            if (Array.isArray(restoredGaps) && restoredGaps.length) state.extractionGaps = M.copy(restoredGaps);
+            else delete state.extractionGaps;
             if (importedState.job && !['done', 'canceled'].includes(importedState.job.status)) {
                 // A recovered draft refers to original books and save receipts. Keep it for export,
                 // but never replay those writes against renamed books or a different transcript.
@@ -2520,11 +3304,99 @@ ${update.content}`;
             if (root.querySelector('[data-import-settings]').checked) Object.assign(s, M.workflow(bundle.workflow));
             Core.registerUnits([s.unit, ...(s.promptLibrary || []).map(p => p.unit)]); this.h.saveSettings();
             await this.h.attach(s.lorebook); await this.persist(); await this.indexBooks(); await this.render(); this.syncOptions(); this.h.rebindSettings();
-            this.h.notify('Story restored into separate private books.' + (state.restoredDrafts?.length ? ' Unfinished imported drafts are retained in backup metadata for export; start a new job against these restored books.' : ''), 'success');
+            this.h.notify('Story restored into standalone private database files.' + (state.restoredDrafts?.length ? ' Unfinished imported drafts are retained in backup metadata for export; start a new job against these restored books.' : ''), 'success');
         });
     }
 
+    renderRecapSchedule() {
+        const plan = M.condensationSchedule(this.entries || [], this.options());
+        const count = plan.groups.reduce((n,g)=>n+g.entries.length,0);
+        const status = this.root?.querySelector('#sa-condense-suggestion');
+        if (status) status.textContent = `${count} eligible scenes in ${plan.groups.length} due recap group(s). Find recap candidates selects the earliest group.`;
+        const clock = this.root?.querySelector('#sa-recap-schedule-status');
+        if (clock) clock.textContent = plan.error || (this.options().trigger === 'time' ? (plan.latest
+            ? `Archive calendar: ${plan.start} to ${plan.latest}. Next period boundary: ${plan.next}. ${plan.groups.length} due group(s). ${plan.undated || 0} scene(s) without reliable full dates; ${plan.singles || 0} completed period(s) with only one uncovered scene.`
+            : 'No reliable full fictional dates in the archive yet.') : `${count} eligible scenes in ${plan.groups.length} due group(s).`);
+        return plan;
+    }
+    async afterArchiveJob(job) {
+        if (!job || job.status !== 'done' || !['archive','catch-up'].includes(job.kind) || this.liveState().job !== job) return;
+        if (!this.h.settings().databaseOnly || this.options().autoCondense === 'off') return;
+        try { await this.runRecapSchedule(); }
+        catch (error) { Debug.warn('RECAP_SCHEDULE_FAILED', error.message); this.h.notify(`Archive saved. Scheduled recap did not start: ${error.message}`, 'warning'); }
+    }
+    // Use the same input allowance as the real condensation request. A large
+    // completed period may need several linked recap parts, not a doomed call.
+    async scheduledRecapSteps(group, label) {
+        const settings = this.h.settings(), model = this.helperModel();
+        const capacity = this.helperCapacity(model?.output || 6000, model);
+        const background = StoryContext.settingBlock(this.storyContext());
+        const period = group.from ? {from:group.from,through:group.through} : undefined;
+        const parts = [];
+        const fit = async entries => {
+            const request = M.condensationRequest(entries,'recap',label,0,M.recapWritingPrompt(settings));
+            const text = request.system + background + '\n' + request.prompt;
+            const cost = Number(await this.h.tokenCount?.(text)) || M.tokens(text);
+            // Reserve space for the period/part label and a small correction prompt.
+            if (cost + 512 <= capacity.input) { parts.push(entries); return true; }
+            if (entries.length < 4) return false;
+            const midpoint = Math.floor(entries.length/2);
+            return await fit(entries.slice(0,midpoint)) && await fit(entries.slice(midpoint));
+        };
+        if (!(await fit(group.entries))) return [];
+        return parts.map((entries,i)=>this.inputStep(entries,{scheduledPeriod:period ? {...period,...(parts.length>1?{part:i+1,parts:parts.length}:{})} : undefined}));
+    }
+
+    async runRecapSchedule(explicit = false) {
+        const archive = this.h.settings().lorebook, origin = this.identity();
+        if (this.recapScheduling || this.h.isBusy() || this.queue.running || !archive) { if (explicit) this.h.notify('Finish the current operation and select an archive before checking the recap schedule.','info'); return; }
+        if (explicit && this.h.isGenerating?.()) { this.h.notify('Wait for the current RP reply to finish before running a recap.','info'); return; }
+        const current = () => archive === this.h.settings().lorebook && origin === this.identity();
+        this.recapScheduling = true;
+        try {
+            await this.refresh();
+            if (!current() || this.h.isBusy() || this.queue.running) return;
+            const opt = this.options(), state = this.liveState(), plan = this.renderRecapSchedule();
+            if (plan.error) { if (explicit) this.h.notify(plan.error,'warning'); return; }
+            if (!['auto','suggest'].includes(opt.autoCondense)) { if(explicit)this.h.notify('Recap automation is off. The preview is updated; no model request was made.','info'); return; }
+            if (state.branchIntent || state.originChat && state.originChat !== origin) return;
+            if (this.sceneRecall.frame().flashback) { if (explicit) this.h.notify('Scheduled recaps are paused during an active flashback.','info'); return; }
+            if (state.job && !['done','canceled'].includes(state.job.status)) { if(explicit)this.h.notify('Finish or discard the current job before scheduling recaps.','info'); return; }
+            const label = opt.recapLabel || 'Arc';
+            const groups = plan.groups.filter(g=>M.condensationPrecheck(g.entries,'recap',label).possible).map(g=>({...g,key:M.hash([archive,opt.trigger,opt.trigger === 'time' ? opt.afterDays : opt.afterUnits,opt.trigger === 'pressure' ? opt.pressureTokens : null,g.from,g.through,g.entries.map(e=>[M.record(e).id,M.hash(e.content)])])}));
+            if (opt.autoCondense === 'suggest') {
+                const key = M.hash(groups.map(g=>g.key));
+                if (groups.length && (explicit || state.lastSuggestion !== key)) {
+                    state.lastSuggestion = key; await this.persist();
+                    if (current()) this.h.notify(`${groups.length} recap group(s) ready. Open Manage → Create recap or shorten evidence → Find recap candidates. No model request was made.`, 'info');
+                } else if(explicit)this.h.notify('No new recap groups are due.','info');
+                return;
+            }
+            const attempted = new Set(state.recapScheduleAttempts || []);
+            const due = groups.filter(g=>explicit || !attempted.has(g.key));
+            if (!due.length) { if(explicit)this.h.notify('No recap groups are due.','info'); return; }
+            const steps = [], accepted = [];
+            for (const group of due) {
+                const planned = await this.scheduledRecapSteps(group,label);
+                if (!current() || this.h.isBusy() || this.queue.running) return;
+                if (!planned.length) {
+                    this.h.notify(`A due recap${group.from ? ` (${group.from} to ${group.through})` : ''} cannot fit even in smaller groups with at least two scenes. Choose a larger helper context or recap selected scenes manually. No requests were sent for this group.`, 'warning');
+                    continue;
+                }
+                steps.push(...planned); accepted.push(group.key);
+            }
+            if (!steps.length) return;
+            if (state.job && !['done','canceled'].includes(state.job.status)) return;
+            state.recapScheduleAttempts = [...new Set([...attempted,...accepted])].slice(-256);
+            await this.persist();
+            if (!current() || this.h.isBusy() || this.queue.running) return;
+            this.h.notify(`Starting ${steps.length} scheduled recap stage(s). Original scenes will be retained.`, 'info');
+            return await this.createJob('condense',steps,{mode:'recap',label,automatic:true,auditCondense:opt.auditCondense,target:0,scheduled:true});
+        } finally { this.recapScheduling = false; }
+    }
+
     async afterReply() {
+        if (this.h.settings().databaseOnly) return this.runRecapSchedule();
         if (this.h.isBusy() || this.queue.running || !this.h.settings().lorebook) return;
         await this.refresh();
         const opt = this.options(), state = this.state();
@@ -2578,10 +3450,119 @@ ${update.content}`;
         const rangeMemories = this.root?.querySelector('[data-sa-field=rangeMemories]');
         if (rangeMemories) rangeMemories.checked = !!this.h.settings().memoryAuto;
         await this.recoverInterruptedJob();
+        await this.migrateExtractionGaps();
         await this.refresh();
         const state = this.state(), last = state.lastOpened ? Date.parse(state.lastOpened) : null;
         state.lastOpened = M.now(); await this.persist();
         if (this.options().recapOnReturn && last && Date.now() - last >= Number(this.options().recapAfterHours) * 3600000) this.h.offerRecap(() => this.recap());
+    }
+
+    inferredDatesFor(entry, entriesById = new Map(this.entries.map(e => [M.record(e)?.id, e]))) {
+        const r = M.record(entry); if (!r) return [];
+        const own = M.unique(r.dates || []).map(M.calendarDay).filter(Boolean);
+        if (own.length) return own;
+        const linked = M.unique([...(r.derivedFrom || []), ...(r.covers || [])]).flatMap(id => M.record(entriesById.get(id))?.dates || []).map(M.calendarDay).filter(Boolean);
+        if (linked.length) return M.unique(linked);
+        const source = r.source, chat = this.h.context().chat || [];
+        if (source?.chatId !== this.sourceId() || !source.ranges?.length) return [];
+        const fromMessages = [];
+        let last = -1;
+        for (const range of source.ranges) {
+            last = Math.max(last, Number(range.to ?? -1));
+            for (const snap of range.messages || []) {
+                const msg = chat[snap.index];
+                if (msg && M.messageHash(msg) === snap.hash) fromMessages.push(...M.chronology(msg.mes).dates.map(M.calendarDay).filter(Boolean));
+            }
+        }
+        if (fromMessages.length) return M.unique(fromMessages);
+        if (last >= 0 && chat[last]) {
+            const frame = Little.recallFrame(chat.slice(0, last + 1), 'normal', [], this.h.meta().sceneOpeningFlashback);
+            const date = M.calendarDay(frame.flashback || frame.date);
+            if (date) return [date];
+        }
+        return [];
+    }
+
+    async startMissingMemories() {
+        await this.refresh();
+        const pending = M.pendingMemoryUnits(this.entries);
+        if (!pending.length) return null;
+        const s = this.h.settings();
+        const flow = { persona: false, singleRequest: false, includeChatContext: false, auditMemories: false, referenceText: '', referenceReport: null, references: [],
+            profiles: { archive: s.archiveProfile || '', memories: s.sideProfile || '', trackers: s.sideProfile || '', diary: s.diaryProfile || '' } };
+        const steps = this.chunks(pending, Math.min(2,s.memoryDays || 2)).map(group => this.inputStep(group, { kind: 'memories', mode: 'archive', messages: [], force: false, allUnits: false, archiveStage: false }));
+        Debug.info('MEMORY_BACKFILL_STARTED', `Backfilling character memories from ${pending.length} archive unit${pending.length === 1 ? '' : 's'}.`, { units: pending.length, stages: steps.length });
+        return this.createJob('memories', steps, { flow, hide: false });
+    }
+
+    async repairMissingInformation() {
+        if (!this.h.settings().lorebook) throw new Error('Select a database first.');
+        const activeJob = this.liveState().job;
+        if (activeJob && !['done', 'canceled'].includes(activeJob.status)) throw new Error('Finish or discard the current job before repairing missing information.');
+        await this.refresh();
+        const byId = new Map(this.entries.map(e => [M.record(e)?.id, e]));
+        const missingDate = this.entries.filter(e => M.record(e) && M.active(e) && !['opening', 'closing', 'legend'].includes(M.record(e).type) && !(M.record(e).dates || []).map(M.calendarDay).some(Boolean));
+        const pendingMemories = M.pendingMemoryUnits(this.entries);
+        const inferable = missingDate.filter(e => this.inferredDatesFor(e, byId).length);
+        const note = `Repair can fill ${inferable.length} missing date record${inferable.length === 1 ? '' : 's'} from verified source chronology and ${pendingMemories.length} archive unit${pendingMemories.length === 1 ? '' : 's'} still missing character-memory processing. It never invents an unknown date. Character-memory backfill uses your Database extraction profile and opens the normal review.`;
+        if (!inferable.length && !pendingMemories.length) { this.h.notify('No repairable missing dates or unprocessed character-memory units were found.', 'info'); return; }
+        if (!(await this.h.confirmText(note, { okButton: 'Repair missing information', cancelButton: 'Cancel' }))) return;
+        if (inferable.length) await this.withLock(async () => {
+            await this.loadBooks(); const books = M.copy(this.books), bases = this.bases(); let repaired = 0;
+            const current = new Map(this.entries.map(e => [M.record(e)?.id, e]));
+            for (const data of Object.values(books)) for (const entry of Object.values(data.entries || {})) {
+                const r = M.record(entry); if (!r || !current.has(r.id)) continue;
+                const dates = this.inferredDatesFor(current.get(r.id), current);
+                if (!dates.length || (r.dates || []).map(M.calendarDay).some(Boolean)) continue;
+                const visible = r.type === 'unit' ? String(entry.content || '').replace(/^(## ► .+?\s+(?:\d+|\?)\s*[—–]\s*)(?:Unknown(?: Date)?|Date Unknown|\?)(.*)$/mi, `$1${dates[0]}$2`) : entry.content;
+                if (visible !== entry.content) M.revise(entry, visible, 'Repair missing story date from verified source chronology', { dates });
+                else { r.dates = dates; r.updated = M.now(); }
+                repaired++;
+            }
+            if (repaired) { await this.write(books, bases, 'Repair missing date metadata'); Debug.info('MISSING_DATES_REPAIRED', `Filled dates for ${repaired} record${repaired === 1 ? '' : 's'} from verified sources.`, { repaired }); }
+        });
+        await this.refresh();
+        const pendingAfter = M.pendingMemoryUnits(this.entries);
+        if (pendingAfter.length) return this.startMissingMemories();
+        this.h.notify('Missing information repair finished.', 'success');
+    }
+
+    async clearDatabase() {
+        if (!this.h.settings().lorebook) throw new Error('Select a database first.');
+        const activeJob = this.liveState().job;
+        if (activeJob && !['done', 'canceled'].includes(activeJob.status)) throw new Error('Finish or discard the current job before clearing data.');
+        const ok = await this.h.confirmText('Clear all Scene Archivist records and scan coverage for this story? This does not delete SillyTavern chat messages or unrelated lorebook entries. Export a database backup first if you may want this data back.', { okButton: 'Clear Scene Archivist data', cancelButton: 'Cancel' });
+        if (!ok) return;
+        await this.withLock(async () => {
+            await this.loadBooks(); const books = M.copy(this.books), bases = this.bases(), storyId = this.state().storyId; let removed = 0;
+            for (const data of Object.values(books)) {
+                for (const [uid, entry] of Object.entries(data.entries || {})) if (M.record(entry)?.storyId === storyId) { delete data.entries[uid]; removed++; }
+                data.sceneArchivistReceipts = [];
+                if (data.sceneArchivistStory?.id === storyId) Little.setLittleThings(data, [], storyId);
+            }
+            await this.write(books, bases, 'Clear Scene Archivist story data');
+            const st = this.liveState();
+            for (const key of ['job','history','findings','findingsRun','findingsScope','chatMemoryReceipts','followups','restoredDrafts','diaryCast','diaryPolicies','storyContexts','recapScheduleAttempts','lastSuggestion']) delete st[key];
+            st.coverage = {}; st.applied = []; st.telemetry = { requests: 0, input: 0, output: 0 };
+            const meta = this.h.meta(); meta.ranges = []; meta.archivedThrough = -1; meta.lastDay = 0; meta.at = 0; meta.messages = 0;
+            this.selected.clear(); await this.persist(); Debug.info('DATABASE_CLEARED', `Cleared ${removed} Scene Archivist record${removed === 1 ? '' : 's'} for the current story.`, { removed });
+        });
+        await this.refresh(); this.h.notify('Scene Archivist data for this story was cleared. Chat messages were not touched.', 'success');
+    }
+
+    async showDebugLog() {
+        const root = document.createElement('div'); root.className = 'sa-review';
+        const pre = document.createElement('pre'); pre.className = 'sa-debug-log';
+        pre.textContent = Debug.text() || 'No Scene Archivist diagnostic events have been recorded in this page session.';
+        root.innerHTML = '<h3>Scene Archivist debug log</h3><p class="sa-hint">This in-extension log keeps recent diagnostic events even when console logging is disabled.</p>';
+        root.append(pre);
+        return this.h.show(root);
+    }
+
+    async toggleDebug() {
+        const s = this.h.settings(); s.debugLogging = !s.debugLogging; Debug.configure(s.debugLogging); this.h.saveSettings();
+        this.renderDashboard();
+        this.h.notify(s.debugLogging ? 'Debug console logging enabled.' : 'Debug console logging disabled. The in-extension diagnostic log remains available.', 'info');
     }
 
     async dispatch(action, el) {
@@ -2590,6 +3571,11 @@ ${update.content}`;
         if (await dispatchTool(this, action, el)) return;
         const id = el?.dataset?.id;
         if (action === 'sharing') return this.setShared(!this.books[this.h.settings().lorebook]?.sceneArchivistStory?.shared);
+        if (action === 'debugToggle') return this.toggleDebug();
+        if (action === 'debugView') return this.showDebugLog();
+        if (action === 'debugClear') { Debug.clear(); this.h.notify('Scene Archivist debug log cleared.', 'success'); return; }
+        if (action === 'repairMissing') return this.repairMissingInformation();
+        if (action === 'clearDatabase') return this.clearDatabase();
         if (action === 'refresh') return this.refresh();
         if (action === 'selectVisible') { this.filtered().forEach(x => this.selected.add(M.record(x.entry).id)); this.renderLibrary(); return this.renderDashboard(); }
         if (action === 'clearSelection') { this.selected.clear(); this.renderLibrary(); return this.renderDashboard(); }
@@ -2610,11 +3596,13 @@ ${update.content}`;
             await this.persist();
             return this.withLock(() => this.queue.resume());
         }
+        if (action === 'extractConnection') return this.chooseExtractionConnection();
         if (action === 'flowUseCurrent') return this.retryFlow({ useCurrent: true });
         if (action === 'flowRefreshEvidence') return this.retryFlow({ refreshEvidence: true });
         if (action === 'flowEditArchive') return this.editFailedArchive();
         if (action === 'rangeHide' || action === 'rangeShow') return this.visibility(action === 'rangeShow');
         if (action === 'tidy') return this.withLock(() => this.tidy());
+        if (action === 'runRecapSchedule') return this.runRecapSchedule(true);
         if (action === 'condenseSelected') return this.startCondense(this.selectedEntries());
         if (action === 'condenseSuggested') { this.selected = new Set(M.condensationCandidates(this.entries, this.options()).map(e => M.record(e).id)); this.showTab('library'); this.library?.show('all'); return this.renderDashboard(); }
         if (action === 'suggestRecapGroups') return this.recapSuggestions.suggest();
@@ -2625,15 +3613,35 @@ ${update.content}`;
         if (action === 'newFact') return this.capture('fact');
         if (action === 'newThread') return this.capture('thread');
         if (action === 'memoriesAll') return this.startMemories();
+        if (action === 'backfillKnowledge') return this.backfillFromKnowledge();
+        if (action === 'backfillScenes') return this.startMissingMemories();
+        if (action === 'migrateStorage') return this.h.migrateStorage();
+        if (action === 'treeBrowse') return this.openInformationTree();
+        if (action === 'vectorSync') return this.syncVectors();
+        if (action === 'vectorTest') return this.testVectors();
+        if (action === 'rerankTest') return this.testReranker();
+        if (action === 'rerankClearKey') { this.clearRerankKey(); this.rerankProgress('Session credential cleared.'); return; }
         if (action === 'memoryAudit') return this.startMemoryAudit();
         if (action === 'coverageRepair') { await this.refresh(); this.h.notify('Every source receipt was checked. Missing, changed and unprocessed units are shown above.', 'success'); return; }
+        if (action === 'saveStoryContext') return this.saveStoryContext();
+        if (action === 'saveDiaryIdentity') return this.saveStoryContext(true);
+        if (action === 'diaryDetect') return this.detectDiaryCast();
+        if (action === 'diaryAddCharacter') return this.addDiaryCharacter();
+        if (action === 'diaryExcludeCharacter') return this.excludeDiaryCharacter();
+        if (action === 'diaryBlacklistAdd') return this.changeDiaryExclusion();
+        if (action === 'diaryBlacklistRemove') return this.changeDiaryExclusion(true);
+        if (action === 'diaryRegenerate') return this.regenerateDiary();
+        if (action === 'diaryBulk') return this.startBulkDiaries();
+        if (action === 'diaryEdit') return this.editDiary();
         if (action === 'diary') return this.startDiary();
         if (action === 'diaryUpdate') return this.startDiary(true);
+        if (action === 'diaryRewrite') return this.rewriteDiary();
         if (action === 'diaryCondense') return this.condenseDiary();
         if (action === 'ask') return this.ask(this.value('question'));
         if (action === 'continuityFull') return this.startContinuity('', false, true);
         if (action === 'continuity' || action === 'continuityAll') return this.startContinuity(action === 'continuityAll' ? '' : this.value('question'));
-        if (action === 'jobResume') { const result = await this.withLock(() => this.queue.resume()); if (result?.status === 'done') await this.continueWorkflow(); return result; }
+        if (action === 'jobResume') { const result = await this.withLock(() => this.resumeWithAutoSplit()); if (result?.status === 'done') { await this.continueWorkflow(); await this.afterArchiveJob(result); } return result; }
+        if (action === 'retryExtractionGaps') return this.retryExtractionGaps();
         if (action === 'jobPause') {
             if (!this.isSavingJob(this.liveState().job)) return this.queue.pause();
             return;
@@ -2641,7 +3649,7 @@ ${update.content}`;
         if (action === 'jobCancel') {
             const state = this.liveState(), job = state.job;
             if (!job || this.isSavingJob(job)) return;
-            if (!(await this.h.confirmText('Discard the unfinished job and its unsaved results? Changes already saved in lorebooks are kept.', { okButton: 'Discard job' }))) return;
+            if (!(await this.h.confirmText('Discard the unfinished job and its unsaved results? Changes already saved in the database are kept.', { okButton: 'Discard job' }))) return;
             if (state !== this.liveState() || job !== state.job || this.isSavingJob(job)) return;
             state.followups = [];
             return this.queue.cancel();

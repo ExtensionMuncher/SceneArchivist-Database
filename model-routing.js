@@ -11,7 +11,10 @@ export function completionReply(data, content) {
     const choice = data?.choices?.[0];
     const finishReason = choice?.finish_reason ?? choice?.stop_reason ?? data?.finish_reason ??
         data?.stop_reason ?? data?.stop_type ?? data?.candidates?.[0]?.finishReason;
-    return { content, finishReason };
+    const reasoning = choice?.message?.reasoning_content ?? choice?.message?.reasoning ?? data?.reasoning_content ?? data?.reasoning;
+    const reasoningTokens = Number(data?.usage?.completion_tokens_details?.reasoning_tokens ?? data?.usage?.output_tokens_details?.reasoning_tokens);
+    const reasoningPresent = !!(typeof reasoning === 'string' && reasoning.trim() || Array.isArray(reasoning) && reasoning.length || reasoningTokens > 0);
+    return { content, finishReason, ...(reasoningPresent ? {reasoningPresent:true} : {}), ...(Number.isFinite(reasoningTokens)&&reasoningTokens>=0?{reasoningTokens}:{}) };
 }
 
 export function outputLimitReached(reason) {
@@ -36,15 +39,15 @@ export function createModelRouter({ current, sendProfile, describe = profile => 
                 route.name = describe(route.profile)?.name || route.name;
                 report(route);
                 const result = route.profile
-                    ? await sendProfile(route.profile, profileMessages(request), request.maxTokens, request.includeFinishReason)
+                    ? await sendProfile(route.profile, profileMessages(request), request.maxTokens, request.includeFinishReason, request)
                     : await current(request);
                 assert();
                 const text = typeof result === 'string' ? result : result?.content;
                 const finishReason = request.includeFinishReason ? result?.finishReason : undefined;
-                if ((typeof text !== 'string' || !text.trim()) && !outputLimitReached(finishReason)) throw new Error('The connection returned no text.');
+                if ((typeof text !== 'string' || !text.trim()) && !outputLimitReached(finishReason)) throw new Error('The connection returned no visible text'+(finishReason?' (finish reason: '+String(finishReason).slice(0,60)+')':'')+(result?.reasoningPresent?'; reasoning was returned but no final answer':'')+'.');
                 if (finishReason) route.finishReason = finishReason;
                 route.state = 'received';
-                return request.includeFinishReason ? { content: typeof text === 'string' ? text : '', finishReason } : text;
+                return request.includeFinishReason ? { content: typeof text === 'string' ? text : '', finishReason, ...(result?.reasoningPresent?{reasoningPresent:true}:{}), ...(Number.isFinite(result?.reasoningTokens)?{reasoningTokens:result.reasoningTokens}:{}) } : text;
             } catch (cause) {
                 route.state = 'failed';
                 if (!route.profile) throw cause;
@@ -55,4 +58,18 @@ export function createModelRouter({ current, sendProfile, describe = profile => 
             }
         },
     };
+}
+
+/** Read an optional profile preset without invoking the host's error-logging lookup.
+ * An omitted/deleted preset leaves capacity to the profile's explicit limits or
+ * the caller's existing unknown-capacity fallback. Never select a live preset.
+ */
+export function optionalProfilePreset(context, api, name) {
+    if (typeof name !== 'string' || !name.trim()) return undefined;
+    const list = context.getPresetManager?.(api)?.getPresetList?.();
+    const names = list?.preset_names, presets = list?.presets;
+    if (!names || !presets) return undefined;
+    const index = Array.isArray(names) ? names.indexOf(name)
+        : Object.hasOwn(names, name) ? names[name] : -1;
+    return index === -1 || index === undefined ? undefined : presets[index];
 }

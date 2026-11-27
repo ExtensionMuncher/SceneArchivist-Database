@@ -1,4 +1,5 @@
 import * as M from './memory-engine.js';
+import { markdownPreview } from './markdown-preview.js';
 import * as Core from './core.js';
 import { escape as h } from './workflow-tools.js';
 import { forgetLedgerRange, protectedRecord, recordSources, overlaps } from './recovery-tools.js';
@@ -28,7 +29,7 @@ export function renderRecovery(w) {
     if (names.includes(selected)) select.value = selected;
     const subject = select.value, query = w.value('memorySearch').toLocaleLowerCase();
     const entries = subject ? memoryEntries(w, subject).filter(e => e.content.toLocaleLowerCase().includes(query)) : [];
-    w.root.querySelector('#sa-character-memories').innerHTML = entries.map(e => `<article class="sa-result"><b>${h(M.title(e))}</b>${e.disable ? ' <span class="sa-badge">Hidden from replies</span>' : ''}<p class="sa-hint">${h(e.world)}</p><div class="sa-prose">${h(e.content)}</div><div class="sa-row">${button('inspect','🔬 Inspect / edit',`data-id="${h(M.record(e).id)}"`)}${button('sources','🔗 Sources',`data-id="${h(M.record(e).id)}"`)}${button('characterUpdate','✨ AI update…',`data-id="${h(M.record(e).id)}"`)}</div></article>`).join('') || `<p class="sa-hint">${subject ? 'No matching memory text.' : 'Choose a character to read their memories here.'}</p>`;
+    w.root.querySelector('#sa-character-memories').innerHTML = entries.map(e => `<article class="sa-result"><b>${h(M.title(e))}</b>${e.disable ? ' <span class="sa-badge">Hidden from replies</span>' : ''}<p class="sa-hint">${h(e.world)}</p><div class="sa-prose sa-markdown">${markdownPreview(e.content)}</div><div class="sa-row">${button('inspect','🔬 Inspect / edit',`data-id="${h(M.record(e).id)}"`)}${button('sources','🔗 Sources',`data-id="${h(M.record(e).id)}"`)}${button('characterUpdate','✨ AI update…',`data-id="${h(M.record(e).id)}"`)}</div></article>`).join('') || `<p class="sa-hint">${subject ? 'No matching memory text.' : 'Choose a character to read their memories here.'}</p>`;
     w.renderFindings(w.state().findings || []);
     w.layout?.help.refresh(w.root.querySelector('#sa-character-memories'));
 }

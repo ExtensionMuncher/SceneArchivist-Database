@@ -1,5 +1,6 @@
-import { calendarDay, chronology, copy, hash, messageHash, now, record, tokens, uid, unique } from './memory-engine.js';
+import { calendarDay, chronology, copy, hash, messageHash, now, record, storyMessage, tokens, uid, unique } from './memory-engine.js';
 import { memorySubject } from './chat-workflows.js';
+import { explicitDays } from './memory-cutoff.js';
 
 export function littleThings(book) {
     const notes = book?.sceneArchivistStory?.littleThings;
@@ -141,9 +142,6 @@ const marker = /^\s*(?:[*_#[>]+\s*)?(flashback|time|date|place|location|scene)\s
 const sceneBreak = /^\s*(?:#{1,6}\s*)?(?:[*_]+\s*)?(?:scene break|new scene|end flashback|back to (?:the )?present)[.!]?\s*(?:[*_]+\s*)?$/i;
 const messageMarkers = new WeakMap();
 
-const storyMessage = message => !!message &&
-    (!message.is_system || !message.extra?.type && (message.is_user || message.is_name));
-
 export function setFlashback(chat, metadata, value) {
     const date = value === '' ? '' : calendarDay(value);
     if (date === null) throw new Error('Choose a valid story date.');
@@ -268,9 +266,11 @@ const recalledTypes = new Set(['unit', 'recap', 'memory', 'fact', 'knowledge', '
 export function flashbackReason(entry, frame) {
     const r = record(entry);
     if (!frame.flashback || !r || !recalledTypes.has(r.type) && !['tracker', 'state'].includes(r.type)) return '';
-    const dates = [...(r.dates || []), r.learnedAt].map(calendarDay).filter(Boolean);
-    if (!dates.length) return 'No dated evidence for this flashback';
-    return dates.some(date => date > frame.flashback) ? 'After this flashback' : '';
+    const values = [...(r.dates || []), r.learnedAt].filter(value => String(value || '').trim());
+    const parsed = values.map(explicitDays);
+    const dates = parsed.flat();
+    if (!dates.length || parsed.some(days => !days.length)) return 'No reliable complete dated evidence for the active scene date';
+    return dates.some(date => date > frame.flashback) ? 'After the active scene date' : '';
 }
 
 export function recordRecall(entries, frame, chat = [], carry = new Map()) {

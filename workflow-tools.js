@@ -109,9 +109,9 @@ export function preserveKnowledge(entry, patch) {
 }
 export function knowledgeAt(entries, subject, date) {
     const cutoff = calendarDay(date); if (!cutoff) throw new Error('Choose a full calendar date, including its year.');
-    const known = [], unknown = [], byId = new Map(entries.filter(M.record).map(e => [M.record(e).id, e]));
+    const known = [], unknown = [], byId = new Map(entries.filter(M.record).map(e => [M.record(e).id, e])), names=new Set((Array.isArray(subject)?subject:[subject]).map(n=>String(n).toLocaleLowerCase()));
     for (const e of entries) {
-        const r = M.record(e); if (!r || !['memory', 'knowledge'].includes(r.type) || ['superseded', 'resolved'].includes(r.status) || ![r.subject, ...(r.aliases || [])].some(n => String(n || '').toLocaleLowerCase() === subject.toLocaleLowerCase())) continue;
+        const r = M.record(e); if (!r || !['memory', 'knowledge'].includes(r.type) || ['superseded', 'resolved'].includes(r.status) || ![r.subject, ...(r.aliases || [])].some(n => names.has(String(n || '').toLocaleLowerCase()))) continue;
         if (r.status !== 'current') { unknown.push(e); continue; }
         const versions = [...(r.knowledgeHistory || []), { ...r, content: e.content }];
         const proven = v => Object.entries(v.derivedHashes || {}).every(([id, hash]) => byId.has(id) && ['current','superseded','resolved'].includes(M.record(byId.get(id)).status) && M.hash(byId.get(id).content) === hash);

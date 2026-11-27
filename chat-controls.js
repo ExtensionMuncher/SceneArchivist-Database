@@ -1,7 +1,5 @@
 import { anchorMessage, isSkipped, rangeControl, resolveEndpoints, setEndpoint, toggleSkipped } from './chat-workflows.js';
-import { archivedRanges } from './core.js';
 import { flashbackPicker } from './flashback-picker.js';
-import { messageHash } from './memory-engine.js';
 
 const actionButton = (label, action) => {
     const button = document.createElement('button');
@@ -88,6 +86,7 @@ export class ChatControls {
     }
 
     open(trigger, messageNode, selected) {
+        if (this.w.h.settings().showMessageActions !== true || !trigger.isConnected) return;
         if (this.trigger === trigger) { this.close(true); return; }
         this.close();
         const index = Number(messageNode.getAttribute('mesid')), message = this.chat()[index];
@@ -97,17 +96,18 @@ export class ChatControls {
         menu.id = 'sa-message-menu';
         menu.setAttribute('role', 'group');
         menu.setAttribute('aria-label', `Scene Archivist actions for message ${index}`);
+        const database = !!this.w.h.settings().databaseOnly;
         const actions = [
             ['Start range here', () => this.pick('from', index)],
             ['End range here', () => this.pick('to', index)],
-            ['Remember this', () => this.w.extras.remember(index, selected)],
-            [isSkipped(this.state(), message) ? 'Include in archive again' : 'Skip when archiving', async () => {
+            [database ? 'Save evidence detail' : 'Remember this', () => this.w.extras.remember(index, selected)],
+            [isSkipped(this.state(), message) ? (database ? 'Include in scan again' : 'Include in archive again') : (database ? 'Skip when scanning' : 'Skip when archiving'), async () => {
                 toggleSkipped(rangeControl(this.w.h.meta()), message);
                 await this.save();
                 this.w.renderFlow();
             }],
         ];
-        if (!message.is_user) actions.push(['What went into this reply?', () => this.w.extras.prompt.show(index, true)]);
+        if (!database && !message.is_user) actions.push(['What went into this reply?', () => this.w.extras.prompt.show(index, true)]);
         const heading = document.createElement('small');
         heading.textContent = `Scene Archivist · #${index}`;
         menu.append(heading);
@@ -118,7 +118,7 @@ export class ChatControls {
         document.body.append(menu);
         const rect = trigger.getBoundingClientRect(), width = menu.offsetWidth, height = menu.offsetHeight;
         menu.style.left = Math.max(8, Math.min(rect.right - width, innerWidth - width - 8)) + 'px';
-        menu.style.top = Math.max(8, rect.bottom + height + 12 <= innerHeight ? rect.bottom + 5 : rect.top - height - 5) + 'px';
+        menu.style.top = Math.max(8, Math.min(innerHeight - height - 8, rect.bottom + height + 12 <= innerHeight ? rect.bottom + 5 : rect.top - height - 5)) + 'px';
         this.menu = menu;
         this.trigger = trigger;
         trigger.setAttribute('aria-expanded', 'true');
@@ -127,126 +127,129 @@ export class ChatControls {
 
     mount(messageIndex) {
         this.renderScene();
-        const chat = this.chat(), bounds = this.endpoints(), metadata = this.w.h.meta();
-        const receipts = metadata.workbench?.chatMemoryReceipts || [];
-        const coverage = archivedRanges(metadata);
-        const legacy = coverage.filter(range => !range.source?.ranges?.length);
-        const archiveHits = new Map(), memoryHits = new Set();
-        for (const range of coverage) {
-            for (const source of range.source?.ranges || []) {
-                for (const message of source.messages || []) archiveHits.set(`${message.index}:${message.hash}`, range);
-            }
-        }
-        for (const receipt of receipts) {
-            for (const source of receipt.source?.ranges || []) {
-                for (const message of source.messages || []) memoryHits.add(`${message.index}:${message.hash}`);
-            }
-        }
+        const showActions = this.w.h.settings().showMessageActions === true;
+        if (!showActions || (this.trigger && !this.trigger.isConnected)) this.close();
+        const chat = this.chat();
         const currentIndex = Number.isInteger(Number(messageIndex)) && messageIndex != null ? Number(messageIndex) : null;
         const messages = document.querySelectorAll(currentIndex == null ? '#chat .mes[mesid]' : `#chat .mes[mesid="${currentIndex}"]`);
+        this.messageActions ??= new WeakMap();
         for (const node of messages) {
             const index = Number(node.getAttribute('mesid')), message = chat[index];
-            const toolbar = node.querySelector('.mes_buttons');
-            if (!toolbar || !message) continue;
-            if (!toolbar.querySelector('.sa-message-action')) {
-                const trigger = document.createElement('button');
-                trigger.type = 'button';
-                trigger.className = 'mes_button sa-message-action fa-solid fa-book-open';
-                trigger.title = 'Scene Archivist · range and memory';
-                trigger.setAttribute('aria-label', 'Scene Archivist message actions');
-                trigger.setAttribute('aria-controls', 'sa-message-menu');
-                trigger.setAttribute('aria-expanded', 'false');
-                let selected = '';
-                trigger.addEventListener('pointerdown', () => {
-                    const selection = window.getSelection();
-                    selected = node.querySelector('.mes_text')?.contains(selection?.anchorNode) ? selection.toString().trim() : '';
-                });
-                trigger.addEventListener('click', event => { event.stopPropagation(); this.open(trigger, node, selected); selected = ''; });
-                const more = toolbar.querySelector(':scope > .extraMesButtons');
-                if (more) more.after(trigger);
-                else toolbar.append(trigger);
+            const text = node.querySelector('.mes_text');
+            // Never delete, hide, replace or move a shared toolbar or a container
+            // that holds another extension's controls. Remove only our identifiable
+            // legacy leaves, and discard an old wrapper only when genuinely empty.
+            for (const old of node.querySelectorAll('.sa-message-action')) {
+                if (old.getAttribute('aria-label') === 'Scene Archivist message actions' &&
+                    old.getAttribute('aria-controls') === 'sa-message-menu' &&
+                    old.childElementCount === 0) old.remove();
             }
-            const badges = [];
-            if (bounds.from.index === index) badges.push(['Range start', 'endpoint']);
-            if (bounds.to.index === index) badges.push(['Range end', 'endpoint']);
-            if (isSkipped(this.state(), message)) badges.push(['Archive skip', 'endpoint']);
-            if (this.w.options().messageBadges !== 'off' && !message.is_system) {
-                const key = `${index}:${messageHash(message)}`;
-                const covered = archiveHits.get(key) || legacy.find(range => index >= range.from && index <= range.to);
-                const remembered = memoryHits.has(key);
-                if (covered) badges.push([covered.days?.length ? `Archived · ${covered.days.join(', ')}` : 'Archived', 'status']);
-                else if (!isSkipped(this.state(), message)) badges.push(['To archive', 'status']);
-                if (remembered) badges.push(['Memories made', 'status']);
+            for (const strip of node.querySelectorAll('span.sa-message-badges')) {
+                for (const badge of [...strip.children]) {
+                    if (badge.tagName === 'SPAN' && badge.childElementCount === 0 &&
+                        ['status', 'endpoint'].includes(badge.dataset.kind) &&
+                        badge.title === badge.textContent && /^(?:To archive|Archived(?: · .+)?|Memories made|Range start|Range end|Archive skip)$/.test(badge.textContent)) badge.remove();
+                }
+                if (!strip.children.length && /^(?:\s*|To archive|Archived(?: · .+)?|Memories made|Range start|Range end|Archive skip)$/.test(strip.textContent)) strip.remove();
             }
-            const header = toolbar.closest('.ch_name');
-            const metadataLine = header?.querySelector('.timestamp, .name_text')?.parentElement;
-            let strip = node.querySelector('.sa-message-badges');
-            if (!badges.length || !metadataLine) { strip?.remove(); continue; }
-            if (!strip) {
-                strip = document.createElement('span');
-                strip.className = 'sa-message-badges';
+            for (const footer of node.querySelectorAll('div.sa-message-footer')) {
+                if (!footer.children.length && !footer.textContent.trim()) footer.remove();
             }
-            if (strip.parentElement !== metadataLine) {
-                if (metadataLine === header) toolbar.before(strip);
-                else metadataLine.append(strip);
+            const host = text?.parentElement;
+            let trigger = this.messageActions.get(node);
+            // Clones made by host rerenders do not retain event handlers. Only the
+            // current instance's own button is reusable; foreign children stay put.
+            for (const candidate of node.querySelectorAll('button[data-scene-archivist-control="message-action"]')) {
+                if ((!showActions || !host || !message || candidate !== trigger || candidate.parentElement !== host) && candidate.childElementCount === 0) candidate.remove();
             }
-            strip.dataset.mobile = this.w.options().messageBadges === 'all' ? 'show' : 'hide';
-            strip.replaceChildren(...badges.map(([text, kind]) => {
-                const badge = document.createElement('span');
-                badge.textContent = text;
-                badge.title = text;
-                badge.dataset.kind = kind;
-                return badge;
-            }));
+            if (!showActions || !host || !message) {
+                this.messageActions.delete(node);
+                continue;
+            }
+            if (trigger?.isConnected && trigger.parentElement === host) continue;
+            trigger = document.createElement('button');
+            trigger.type = 'button';
+            trigger.dataset.sceneArchivistControl = 'message-action';
+            trigger.textContent = 'Archivist';
+            trigger.title = this.w.h.settings().databaseOnly ? 'Scene Archivist · range and evidence' : 'Scene Archivist · range and memory';
+            trigger.setAttribute('aria-label', 'Scene Archivist message actions');
+            trigger.setAttribute('aria-controls', 'sa-message-menu');
+            trigger.setAttribute('aria-expanded', 'false');
+            let selected = '';
+            trigger.addEventListener('pointerdown', () => {
+                const selection = window.getSelection();
+                selected = node.querySelector('.mes_text')?.contains(selection?.anchorNode) ? selection.toString().trim() : '';
+            });
+            trigger.addEventListener('click', event => {
+                event.stopPropagation();
+                this.open(trigger, node, selected);
+                selected = '';
+            });
+            // Append after existing content; do not insert between host/extension
+            // siblings or place our button in .mes_buttons / .extraMesButtons.
+            host.append(trigger);
+            this.messageActions.set(node, trigger);
         }
     }
 
     anchor(index) { return anchorMessage(this.chat()[index]); }
 
     mountSceneControls() {
-        const composer = document.querySelector('#send_form');
-        if (!composer) return;
-        const run = action => void action().catch(error => this.w.h.notify(error.message, 'warning'));
-        this.flashbackStart = actionButton('', () => run(() => this.chooseFlashback()));
-        this.flashbackStart.className = 'sa-flashback-start fa-solid fa-clock-rotate-left';
-        this.flashbackStart.title = 'Start flashback';
-        this.flashbackStart.setAttribute('aria-label', 'Start flashback');
-        this.flashbackStart.setAttribute('aria-haspopup', 'dialog');
-        const toolbar = composer.querySelector('#leftSendForm') || composer;
-        toolbar.append(this.flashbackStart);
-        this.sceneControls = document.createElement('div');
-        this.sceneControls.className = 'sa-composer-scene';
-        this.sceneControls.hidden = true;
-        this.sceneControls.innerHTML = `<span role="status"></span>
-            <button type="button" class="menu_button" aria-haspopup="dialog">Change date</button>
-            <button type="button" class="menu_button">Back to present</button>`;
-        const [change, end] = this.sceneControls.querySelectorAll('button');
-        change.addEventListener('click', () => run(() => this.chooseFlashback()));
-        end.addEventListener('click', () => run(() => this.changeFlashback('')));
-        composer.prepend(this.sceneControls);
+        // Refresh before the native wand opens, including if ST rebuilt its menu.
+        document.addEventListener('click', event => {
+            if (event.target.closest?.('#extensionsMenuButton')) this.renderScene();
+        }, true);
         this.renderScene();
     }
 
     renderScene() {
-        const w = this.w, controls = this.sceneControls;
-        if (!controls) return;
+        // Remove legacy composer controls even on an in-session upgrade.
+        document.querySelectorAll('#send_form .sa-flashback-start, #send_form .sa-composer-scene').forEach(node => node.remove());
+        const menu = document.getElementById('extensionsMenu');
+        if (!menu) return;
+        let row = this.sceneControls;
+        if (!row || row.parentElement !== menu) {
+            row?.remove();
+            menu.querySelector('#sa_wand_scene_date')?.remove();
+            row = document.createElement('div');
+            row.id = 'sa_wand_scene_date';
+            row.className = 'list-group-item flex-container flexGap5';
+            row.tabIndex = 0;
+            row.setAttribute('role', 'button');
+            row.setAttribute('aria-haspopup', 'dialog');
+            row.innerHTML = '<div class="fa-solid fa-clock-rotate-left extensionsMenuExtensionButton" aria-hidden="true"></div><span></span>';
+            row.addEventListener('click', () => {
+                if (!row.hidden) void this.chooseFlashback().catch(error => this.w.h.notify(error.message, 'warning'));
+            });
+            row.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); row.click(); }
+            });
+            const launcher = menu.querySelector('#sa_wand_panel');
+            if (launcher) launcher.after(row);
+            else menu.append(row);
+            this.sceneControls = row;
+        }
+        const w = this.w;
         const available = w.options().sceneRecall && w.h.isActive() && !!w.h.context().chatId;
         const date = available ? w.sceneRecall.frame().flashback : '';
-        this.flashbackStart.hidden = !available || !!date;
-        controls.hidden = !date;
-        const status = controls.querySelector('[role="status"]');
-        const label = date ? '🕰️ Flashback · ' + new Date(date + 'T00:00:00Z').toLocaleDateString(undefined, {
+        row.hidden = !available;
+        const label = date ? 'Scene date · ' + new Date(date + 'T00:00:00Z').toLocaleDateString(undefined, {
             timeZone: 'UTC', calendar: 'gregory', year: 'numeric', month: 'short', day: 'numeric',
-        }) : '';
-        if (status.textContent !== label) status.textContent = label;
+        }) : 'Set scene date';
+        const text = row.querySelector('span');
+        if (text.textContent !== label) text.textContent = label;
+        row.setAttribute('aria-label', date ? `${label}. Change or clear scene date` : label);
+        row.title = date ? 'Change or clear the active story date' : 'Set a story date for archive retrieval';
     }
 
     async chooseFlashback() {
         const w = this.w, chat = this.chat(), origin = w.identity();
         const frame = w.sceneRecall.frame();
-        const picker = flashbackPicker(frame.flashback ? 'Change flashback date' : 'Start flashback', frame.flashback || frame.date);
+        if (w.h.isBusy() || w.h.isGenerating?.()) throw new Error('Finish the current reply or archive action before changing the scene date.');
+        if (!w.options().sceneRecall || !w.h.isActive() || !w.h.context().chatId) return;
+        const picker = flashbackPicker(frame.flashback ? 'Change scene date' : 'Set scene date', frame.flashback || frame.date, { allowClear: !!frame.flashback });
         if (await w.h.confirm(picker.root, {
-            okButton: 'Set flashback date', wide: false, large: false, canConfirm: picker.validate,
+            okButton: frame.flashback ? 'Apply' : 'Set scene date', wide: false, large: false, canConfirm: picker.validate,
             onOpen: popup => popup.dlg.setAttribute('aria-labelledby', 'sa-flashback-title'),
         })) {
             if (origin !== w.identity() || chat !== this.chat()) return;
@@ -261,7 +264,6 @@ export class ChatControls {
         w.sceneRecall.setFlashback(date);
         this.renderScene();
         await w.persist();
-        const next = date ? this.sceneControls?.querySelector('button:last-child') : this.flashbackStart;
-        next?.focus();
+        document.getElementById('extensionsMenuButton')?.focus();
     }
 }

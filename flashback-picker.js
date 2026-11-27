@@ -7,7 +7,7 @@ const steps = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7 };
 const toDay = value => new Date(`${value}T00:00:00Z`);
 const toISO = day => day.toISOString().slice(0, 10);
 
-export function flashbackPicker(title, selected) {
+export function flashbackPicker(title, selected, { allowClear = false } = {}) {
     const root = document.createElement('div');
     root.className = 'sa-review sa-flashback-picker';
     root.innerHTML = `<h3 id="sa-flashback-title"></h3>
@@ -22,15 +22,23 @@ export function flashbackPicker(title, selected) {
         <div class="sa-flashback-weekdays" aria-hidden="true">${weekdays.map(day => `<span>${day}</span>`).join('')}</div>
         <div class="sa-flashback-days" role="group" aria-labelledby="sa-flashback-month"></div>`;
     root.querySelector('h3').textContent = title;
+    if (allowClear) root.insertAdjacentHTML('beforeend', '<label class="sa-flashback-clear"><input type="checkbox"> Clear scene date</label>');
+    const clear = root.querySelector('.sa-flashback-clear input');
     const input = root.querySelector('input'), month = root.querySelector('#sa-flashback-month');
     const days = root.querySelector('.sa-flashback-days');
     const previous = root.querySelector('[data-month=previous]'), next = root.querySelector('[data-month=next]');
-    const today = new Date();
-    const date = () => input.value.trim();
+    const date = () => clear?.checked ? '' : input.value.trim();
     input.value = selected;
-    let cursor = selected ? toDay(selected) : new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()));
+    let cursor = selected ? toDay(selected) : null;
 
     function render() {
+        if (clear?.checked || !cursor) {
+            month.textContent = clear?.checked ? 'No date restriction' : 'Enter a story date';
+            previous.disabled = true;
+            next.disabled = true;
+            days.replaceChildren();
+            return;
+        }
         const year = cursor.getUTCFullYear(), index = cursor.getUTCMonth();
         const first = new Date(Date.UTC(year, index, 1));
         const count = new Date(Date.UTC(year, index + 1, 0)).getUTCDate();
@@ -57,6 +65,7 @@ export function flashbackPicker(title, selected) {
     }
 
     function moveMonth(step) {
+        if (!cursor) return;
         cursor = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + step, 1));
         render();
     }
@@ -87,11 +96,18 @@ export function flashbackPicker(title, selected) {
         input.setCustomValidity('');
         const value = date();
         if (calendarDay(value) === value) cursor = toDay(value);
+        else cursor = null;
         render();
     });
 
+    clear?.addEventListener('change', () => {
+        input.disabled = clear.checked;
+        input.setCustomValidity('');
+        render();
+    });
     render();
     return { root, date, validate: () => {
+        if (clear?.checked) return true;
         const value = date();
         input.setCustomValidity(calendarDay(value) === value ? '' : 'Pick a day or enter a valid date as YYYY-MM-DD.');
         return input.reportValidity();

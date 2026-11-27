@@ -12,7 +12,7 @@ export async function reviewChanges(workbench, changes, title = 'Review changes'
     const root = document.createElement('div'); root.className = 'sa-review';
     root.innerHTML = `<h3>${html(title)}</h3><p class="sa-note">${html(note || 'Review the result before it is saved. The old content remains in revision history.')}</p>`;
     const hasLittleThings = changes.some(change => change.note);
-    if (hasLittleThings) root.insertAdjacentHTML('beforeend', '<p class="sa-hint">Uncheck any Little Thing you want to skip when you save. Review later keeps the whole draft.</p>');
+    if (hasLittleThings) root.insertAdjacentHTML('beforeend', '<p class="sa-hint">Little Things use the same review decisions as other proposals. Review later keeps the whole draft.</p>');
     const groups = M.unique(changes.map(change => change.section));
     if (groups.length > 1) {
         root.classList.add('sa-combined-review');
@@ -34,8 +34,10 @@ export async function reviewChanges(workbench, changes, title = 'Review changes'
         root.append(filters);
     }
     if (options.partial) {
+        root.insertAdjacentHTML('beforeend', '<p class="sa-hint">Unchecking a result keeps it for later. Mark Discard to permanently reject an unwanted proposal when you save. Saved entries are never deleted by rejecting a proposed change.</p>');
         const toolbar = document.createElement('div'); toolbar.className = 'sa-row';
-        for (const [label, checked] of [['Select all results', true], ['Clear all selections', false]]) { const b = document.createElement('button'); b.type = 'button'; b.className = 'menu_button'; b.textContent = label; b.addEventListener('click', () => root.querySelectorAll('[data-review-include]:not(:disabled)').forEach(c => { c.checked = checked; })); toolbar.append(b); }
+        for (const [label, checked] of [['Select all results', true], ['Clear all selections', false]]) { const b = document.createElement('button'); b.type = 'button'; b.className = 'menu_button'; b.textContent = label; b.addEventListener('click', () => root.querySelectorAll('[data-review-include]:not(:disabled)').forEach(c => { c.checked = checked; if (checked) { const reject = c.closest('.sa-proposal')?.querySelector('[data-review-discard]'); if (reject) reject.checked = false; } })); toolbar.append(b); }
+        const rejectUnchecked = document.createElement('button'); rejectUnchecked.type = 'button'; rejectUnchecked.className = 'menu_button'; rejectUnchecked.textContent = 'Mark unchecked for discard'; rejectUnchecked.addEventListener('click', () => { for (const node of root.querySelectorAll('.sa-proposal')) { const include = node.querySelector('[data-review-include]'), discard = node.querySelector('[data-review-discard]'); if (include && !include.checked && discard) discard.checked = true; } }); toolbar.append(rejectUnchecked);
         root.append(toolbar);
     }
     const job = workbench.state().job?.status === 'running' ? workbench.state().job : null, edits = job ? (job.reviewEdits ??= {}) : {};
@@ -46,7 +48,7 @@ export async function reviewChanges(workbench, changes, title = 'Review changes'
             const heading = document.createElement('h4'); heading.textContent = section; heading.dataset.reviewSection = section; root.append(heading);
         }
         const key = proposalKey(c), saved = edits[key];
-        if (saved) {
+        if (saved && !c.conflict && typeof saved.content === 'string') {
             if (c.content !== saved.content) delete c.afterTokens;
             c.content = saved.content;
             if (!c.conflict) c.include = saved.include;
@@ -65,7 +67,9 @@ export async function reviewChanges(workbench, changes, title = 'Review changes'
         if (c.conflict) {
             const conflict = document.createElement('p'); conflict.className = 'sa-warnline'; conflict.textContent = c.conflict.message;
             d.querySelector('summary').after(conflict); d.open = true;
-            d.insertAdjacentHTML('beforeend', '<label class="checkbox_label"><input type="checkbox" data-review-discard><span>Discard this proposal</span></label>');
+        }
+        if (options.partial || c.conflict) {
+            d.querySelector('summary').insertAdjacentHTML('afterend', '<label class="checkbox_label sa-discard-proposal"><input type="checkbox" data-review-discard><span>Discard this proposal</span></label>');
         }
         if (c.warning) {
             const warning = document.createElement('p'); warning.className = 'sa-warnline'; warning.textContent = c.warning;
@@ -75,6 +79,13 @@ export async function reviewChanges(workbench, changes, title = 'Review changes'
         if (c.before || directConflict) d.querySelector('[data-review-before]').textContent = c.before || 'No saved entry in this slot.';
         if (directConflict) d.querySelector('[data-review-original]').textContent = c.conflict.original ?? 'No entry before the job started.';
         const check = d.querySelector('[data-review-include]'); if (check) { check.disabled = !!c.conflict; check.checked = !c.conflict && c.include !== false; check.addEventListener('click', e => e.stopPropagation()); }
+        const discard = d.querySelector('[data-review-discard]');
+        if (discard) {
+            discard.checked = !!saved?.discard;
+            if (discard.checked && check) check.checked = false;
+            discard.addEventListener('change', () => { if (discard.checked && check) check.checked = false; });
+            check?.addEventListener('change', () => { if (check.checked) discard.checked = false; });
+        }
         const diff = d.querySelector('.sa-diff');
         if (diff) diff.innerHTML = diffHtml(c.before, c.content);
         const update = () => {
@@ -91,21 +102,22 @@ export async function reviewChanges(workbench, changes, title = 'Review changes'
         }
         root.append(d); c.node = d;
     }
-    const accepted = await workbench.h.confirm(root, { okButton: options.partial ? '💾 Save selected' : '💾 Save reviewed result', cancelButton: job?.status === 'running' ? 'Review later' : 'Cancel' });
+    const accepted = await workbench.h.confirm(root, { okButton: options.partial ? '💾 Save selected / discard marked' : '💾 Save reviewed result', cancelButton: job?.status === 'running' ? 'Review later' : 'Cancel' });
     for (const c of changes) {
         const editedText = reviewedContent(c.node);
         const originalText = String(c.content || '');
         // Accepting an untouched review must preserve source hashes, including
         // existing trailing whitespace and normalized textarea line endings.
         c.content = editedText.trim() === originalText.replace(/\r\n?/g, '\n').trim() ? originalText : editedText.trim();
-        c.include = !c.conflict && (c.node.querySelector('[data-review-include]')?.checked ?? true);
-        c.discard = accepted && !!c.node.querySelector('[data-review-discard]')?.checked;
-        if (job && !c.conflict) edits[proposalKey(c)] = { content: c.content, include: c.include };
+        const reject = !!c.node.querySelector('[data-review-discard]')?.checked;
+        c.include = !reject && !c.conflict && (c.node.querySelector('[data-review-include]')?.checked ?? true);
+        c.discard = accepted && reject;
+        if (job) { const key = proposalKey(c); edits[key] = c.conflict ? { ...(edits[key] || {}), include: false, discard: reject } : { content: c.content, include: c.include, discard: reject }; }
         delete c.node;
     }
     if (job) await workbench.persist();
     if (!accepted) return false;
     if (changes.some(c => c.include && !c.content)) throw new Error('An approved entry cannot be empty.');
-    if (options.partial && !hasLittleThings && !changes.some(c => c.include || c.discard)) throw new Error('Choose a result to save or discard, or use Review later to retain all results.');
+    if (options.partial && !changes.some(c => c.include || c.discard)) throw new Error('Choose a result to save or discard, or use Review later to retain all results.');
     return true;
 }

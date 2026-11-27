@@ -69,9 +69,11 @@ export class WorkbenchExtras {
         const rows = (w.h.meta().journals || []).filter(item => item.archive === archive && ['saved', 'undone'].includes(item.status)).slice(-3).reverse();
         recent.replaceChildren(...(rows.length ? rows.map(item => el('li', `${jobLabel(item.label || 'Story changes')} · ${item.status === 'undone' ? 'Undone' : 'Saved'}`)) : [el('li', 'Your next saved scene will appear here.')]));
         const warnings = root.querySelector('#sa-story-warnings');
-        warnings.textContent = archive && !w.h.isActive() ? '⚠️ Attach your archive to use it in replies.' :
+        const database = !!w.h.settings().databaseOnly;
+        warnings.textContent = !database && archive && !w.h.isActive() ? '⚠️ Attach your archive to use it in replies.' :
             job?.error ? `⚠️ ${job.error}` : w.state().branchLineage?.parent ? `🌿 Branched from ${w.state().branchLineage.parent}` : '';
-        root.querySelector('[data-sa-action=storyAttach]').hidden = !archive || w.h.isActive();
+        const attach = root.querySelector('[data-sa-action=storyAttach]');
+        if (attach) attach.hidden = database || !archive || w.h.isActive();
         const scope = root.querySelector('#sa-profile-scope');
         if (scope) scope.textContent = w.h.profileState?.().label || '🌐 Global workflow';
         this.renderThreads();
@@ -182,21 +184,23 @@ export class WorkbenchExtras {
         const w = this.w, chat = w.h.context().chat, message = chat[index], origin = w.identity();
         if (!message) throw new Error('That message is no longer available.');
         const anchor = w.chatControls.anchor(index), hash = M.messageHash(message);
-        const root = form(`🧠 Remember this · #${index}`, 'Save a memory or keep a small detail with this message as its source.');
+        const database = !!w.h.settings().databaseOnly;
+        const root = form(database ? `🧷 Save evidence detail · #${index}` : `🧠 Remember this · #${index}`,
+            database ? 'Save a small source-linked continuity detail for later retrieval. This does not create a character-memory list or inject anything into RP.' : 'Save a memory or keep a small detail with this message as its source.');
         const type = field(root, 'Save as', el('select'));
-        type.add(new Option('Character memory', 'memory'));
-        type.add(new Option('Little Thing', 'little'));
+        if (!database) type.add(new Option('Character memory', 'memory'));
+        type.add(new Option(database ? 'Evidence detail (Little Thing)' : 'Little Thing', 'little'));
         const group = w.h.groupSpeaker?.(), context = w.h.context();
         const cards = group?.members || (context.characters || []).filter(card => card.name).map(card => ({ name: card.name, avatar: card.avatar }));
-        const select = field(root, 'Who remembers it?', el('select'));
+        const select = field(root, database ? 'Known by' : 'Who remembers it?', el('select'));
         select.add(new Option('✏️ Enter a character or NPC name', ''));
         for (const card of cards) select.add(new Option(card.name + (cards.filter(c => c.name === card.name).length > 1 ? ` · ${card.avatar}` : ''), card.avatar));
-        const who = field(root, 'Name for an NPC or persona (blank for a shared Little Thing)', el('input'));
+        const who = field(root, database ? 'NPC/persona name (blank = shared detail)' : 'Name for an NPC or persona (blank for a shared Little Thing)', el('input'));
         const sameName = cards.filter(card => card.name === message.name && !message.is_user);
         const guess = message.original_avatar || (sameName.length === 1 ? sameName[0].avatar : '');
         if (guess && [...select.options].some(option => option.value === guess)) select.value = guess;
         who.value = message.name || '';
-        const draft = field(root, 'Memory', el('textarea'));
+        const draft = field(root, database ? 'Evidence detail' : 'Memory', el('textarea'));
         draft.rows = 5;
         draft.value = selected || String(message.mes || '').trim().slice(0, 1000);
         const keywords = field(root, 'Keywords, separated by commas', el('input'));
@@ -205,7 +209,7 @@ export class WorkbenchExtras {
             tidy.disabled = true;
             try {
                 if (!draft.value.trim()) return;
-                draft.value = (await w.call({ system: 'Rewrite this one memory more concisely. Preserve all facts and quotes. Return only the revised text.', prompt: draft.value, maxTokens: 500 }, 'Polish one memory')).trim();
+                draft.value = (await w.call({ system: database ? 'Rewrite this one source-backed continuity detail more concisely. Preserve all facts and quotes. Return only the revised text.' : 'Rewrite this one memory more concisely. Preserve all facts and quotes. Return only the revised text.', prompt: draft.value, maxTokens: 500 }, database ? 'Polish evidence detail' : 'Polish one memory')).trim();
             } catch (error) { w.h.notify(error.message, 'error'); } finally { tidy.disabled = false; }
         });
         root.append(tidy);

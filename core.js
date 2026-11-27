@@ -1,7 +1,7 @@
 // Scene Archivist: pure logic (no SillyTavern imports), so it can be tested in Node.
 
 import { estimateTokens } from './token-estimate.js';
-import { active, recapReview } from './memory-engine.js';
+import { active, recapReview, storyMessage } from './memory-engine.js';
 
 // The log can count its units as Days, Episodes, Chapters and so on. Headings keep whatever word the log uses.
 export const UNITS = ['Day', 'Episode', 'Chapter', 'Session', 'Act', 'Part', 'Week', 'Scene'];
@@ -117,8 +117,7 @@ export function parseArchivistOutput(raw) {
     }
     if (!res.entries.length && !Object.keys(res.states).length) res.warnings.push('No Day entries or state sections were found in the output.');
     const missing = STATE_NAMES.filter(n => !(n in res.states));
-    if (res.entries.length && missing.length === STATE_NAMES.length) res.warnings.push('The output has no state sections (Open Threads to World State). It may have been cut off.');
-    else if (missing.length && Object.keys(res.states).length) res.warnings.push('Missing state sections (existing ones stay as they are): ' + missing.join(', '));
+        if (missing.length && Object.keys(res.states).length) res.warnings.push('Missing state sections (legacy records stay as they are): ' + missing.join(', '));
     return res;
 }
 
@@ -584,10 +583,10 @@ export function reorder(data, newUids, opts) {
 /** Text of what the model currently sees as always-on (for the optional "append log to prompt" fallback). */
 export function currentLogText(data, entries = Object.values(data?.entries || {})) {
     const reviews = recapReview(entries);
-    const list = managed(data).filter(({ e }) => e.constant && !e.disable && (!e.sceneArchivist || active(e) && !reviews.has(e.sceneArchivist.id)));
-    const covered = new Set(list.filter(x => x.cl.type === 'recap').flatMap(x => x.e.sceneArchivist.covers || []));
-    return list.filter(x => !covered.has(x.e.sceneArchivist?.id) && !['opening', 'closing', 'tracker'].includes(x.cl.type))
-        .map(x => x.e.content.trim()).join('\n\n');
+    const all = managed(data).filter(({ e }) => !e.disable && (!e.sceneArchivist || active(e) && !reviews.has(e.sceneArchivist.id)));
+    const fixed = all.filter(({ cl }) => ['opening', 'epoch', 'legend'].includes(cl.type));
+    const units = all.filter(({ cl }) => ['day', 'retro', 'skip'].includes(cl.type)).slice(-6);
+    return [...fixed, ...units].map(({ e }) => e.content.trim()).filter(Boolean).join('\n\n');
 }
 
 export function managedSummary(data) {
@@ -895,7 +894,7 @@ export function pendingMessages(chat, meta = {}, { from = null, to = null } = {}
     for (let i = Math.max(0, start); i <= Math.min(end, chat.length - 1); i++) {
         if (!explicit && ranges.some(r => i >= r.from && i <= r.to)) continue;
         const m = chat[i];
-        if (!m || m.is_system || !String(m.mes ?? '').trim()) continue;
+        if (!storyMessage(m)) continue;
         out.push({ idx: i, name: m.name || (m.is_user ? 'User' : 'Character'), text: String(m.mes) });
     }
     return out;
@@ -903,8 +902,8 @@ export function pendingMessages(chat, meta = {}, { from = null, to = null } = {}
 
 export function buildArchivistRequest(promptText, logText, transcript, range, unit = 'Day') {
     const log = logText && logText.trim()
-        ? `CURRENT SCENE LOG (the always-on part; continue from it, never reprint it):\n\n${logText.trim()}`
-        : `CURRENT SCENE LOG: (none yet, so start the log from ${unit} 1)`;
+        ? `CURRENT ARCHIVE CONTEXT (helper-only; this is not injected into roleplay. Continue numbering from it, never reprint it):\n\n${logText.trim()}`
+        : `CURRENT ARCHIVE CONTEXT: (none yet, so start the evidence archive from ${unit} 1)`;
     return {
         system: String(promptText),
         prompt: `${log}\n\n---\n\nTRANSCRIPT TO SUMMARIZE (messages ${range.from} to ${range.to}):\n\n${transcript}\n\n---\n\nNow write the update.`,

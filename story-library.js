@@ -1,4 +1,5 @@
 import * as M from './memory-engine.js';
+import { markdownPreview } from './markdown-preview.js';
 import { same } from './entry-journal.js';
 import { addLittleThings, littleThings, makeLittleThing, noteMatchesUnit, setLittleThings, sourcesOverlap, verifiedNoteSource } from './little-things.js';
 import { recordSources } from './recovery-tools.js';
@@ -14,7 +15,7 @@ export class StoryLibrary {
         this.w = workbench;
         this.pane = workbench.panes.library;
         this.pane.insertAdjacentHTML('afterbegin', `<div class="sa-library-nav" role="group" aria-label="Library views">
-            ${[['timeline', '🗓️ Timeline'], ['little', '🧵 Little Things'], ['all', '📚 All records']].map(([id, label]) =>
+            ${[['timeline', 'Timeline'], ['little', 'Little Things'], ['all', 'All records']].map(([id, label]) =>
                 `<button type="button" class="menu_button" data-sa-library-mode="${id}">${label}</button>`).join('')}
             </div><section class="sa-timeline-reader" data-sa-library-view="timeline"></section>
             <section class="sa-little-list" data-sa-library-view="little" hidden></section>`);
@@ -76,7 +77,7 @@ export class StoryLibrary {
             ${review ? `<p class="sa-note">${html(review)}. Use Repair in Maintain to review a rebuild.</p>` : ''}
             <div class="sa-row">${recordAction('sources', '🔎 View sources', r.id)}${this.jumpButton(source, 'unitSource', r.id)}
                 ${recordAction('inspect', '✏️ Edit summary', r.id)}</div>
-            <h4>🗂️ Summary</h4><pre class="sa-scene-text">${html(String(unit.content).trim().split('\n').slice(1).join('\n').trim() || unit.content)}</pre>
+            <h4>🗂️ Summary</h4><div class="sa-scene-text sa-markdown">${markdownPreview(String(unit.content).trim().split('\n').slice(1).join('\n').trim() || unit.content)}</div>
             <h4>🧠 Linked character memories</h4>
             ${related.length ? `<div class="sa-row">${related.map(entry => recordAction('inspect', html(M.record(entry).subject || M.title(entry)), M.record(entry).id)).join('')}</div>` : '<p class="sa-hint">No character memories link to this scene yet.</p>'}
             <h4>🧵 Little Things</h4>${notes.length ? notes.slice(0, 12).map(note => this.noteRow(note)).join('') : '<p class="sa-hint">No little details saved for this scene.</p>'}
@@ -106,7 +107,7 @@ export class StoryLibrary {
     noteRow(note) {
         const status = note.thread ? note.thread === 'open' ? 'Open thread' : 'Resolved thread' : '';
         const meta = [status, note.date, note.knows?.length ? 'Known by ' + note.knows.join(', ') : 'Shared detail', sourceLabel(note.source) && 'Source ' + sourceLabel(note.source)].filter(Boolean);
-        return `<article class="sa-little-row"><p>${html(note.text)}</p><p class="sa-hint">${html(meta.join(' · '))}</p>
+        return `<article class="sa-little-row"><div class="sa-markdown">${markdownPreview(note.text)}</div><p class="sa-hint">${html(meta.join(' · '))}</p>
             ${note.cues?.length ? `<p class="sa-hint">Cues · ${html(note.cues.join(', '))}</p>` : ''}
             <div class="sa-row">${this.jumpButton(note.source, 'noteSource', note.id)}${note.recordId && this.w.find(note.recordId) ? recordAction('sources', '🔎 Source record', note.recordId) : ''}
                 ${action('editNote', '✏️ Edit detail', note.id)}${action('loadNote', '📌 Load next reply', note.id)}</div></article>`;

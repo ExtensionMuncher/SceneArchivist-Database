@@ -1,16 +1,15 @@
-// Scene Archivist: runs your archivist prompt and files the result into a lorebook.
-// The log lives in lorebook entries delivered through a World Info outlet ({{outlet::scene_log}} in your preset).
+// Scene Archivist: standalone, source-backed archive. Native World Info is only read for legacy migration.
 
 import { extension_settings, getContext } from '../../../extensions.js';
 import * as Host from '../../../../script.js';
-import { saveSettingsDebounced, generateQuietPrompt, generateRaw, chat_metadata, saveMetadata, main_api, characters, this_chid, eventSource, event_types, getCurrentChatId, getRequestHeaders, getMaxContextTokens, getMaxResponseTokens, showMoreMessages, Generate } from '../../../../script.js';
+import { saveSettingsDebounced, generateQuietPrompt, generateRaw, chat_metadata, saveMetadata as saveMetadataHost, main_api, characters, this_chid, eventSource, event_types, getCurrentChatId, getRequestHeaders, getMaxContextTokens, getMaxResponseTokens, showMoreMessages, Generate } from '../../../../script.js';
 import { setExtensionPrompt, extension_prompt_types, extension_prompt_roles } from '../../../../script.js';
 import { callGenericPopup, Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { getCharaFilename, getStringHash, getSanitizedFilename } from '../../../utils.js';
 import { hideChatMessageRange } from '../../../chats.js';
 import * as WorldInfo from '../../../world-info.js';
-import { selected_world_info, METADATA_KEY, createWorldInfoEntry, worldInfoCache, updateWorldInfoList, reloadEditor, world_info, world_info_budget, world_info_budget_cap, world_info_recursive, world_info_max_recursion_steps } from '../../../world-info.js';
-import { oai_settings } from '../../../openai.js';
+import { selected_world_info, METADATA_KEY, world_info, world_info_budget, world_info_budget_cap, world_info_recursive, world_info_max_recursion_steps } from '../../../world-info.js';
+import { oai_settings, getChatCompletionModel } from '../../../openai.js';
 import { getTokenCountAsync } from '../../../tokenizers.js';
 import { power_user } from '../../../power-user.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
@@ -22,13 +21,17 @@ import { Workbench } from './workbench.js';
 import { ChatControls } from './chat-controls.js';
 import { addReviewHandle } from './review-window.js';
 import { VERSION } from './version.js';
-import { completionReply, createModelRouter } from './model-routing.js';
+import { RequestLimiter, normalizeRPM, errorDetails } from './rate-limiter.js';
+import { completionReply, createModelRouter, optionalProfilePreset } from './model-routing.js';
+import { diaryProfileOverride, isGLMDiaryProfile } from './diary-transport.js';
+import { yaml } from '../../../../lib.js';
 import { entryReasons } from './vector-diagnostics.js';
 import { readReferenceEntries as collectReferenceEntries, referenceText } from './reference-context.js';
-import { createWorldInfoIO } from './world-info-io.js';
+import { createDatabaseIO, makeDatabaseEntry } from './database-io.js';
 import * as Journal from './entry-journal.js';
 import { validateSharedUnits, placeSharedUnits } from './workflow-tools.js';
 import { DEFAULT_SETTINGS, DEFAULT_PROMPT, DEFAULT_PROMPT_KEY_EVENTS, BUILTIN_PROMPTS, LEGACY_MEMORY_PROMPTS, LEGACY_CONDENSE_PROMPTS, TRACKER_TEMPLATES } from './defaults.js';
+import * as Debug from './debug-log.js';
 
 const KEY = 'sceneArchivist';
 
@@ -46,6 +49,25 @@ let chatControls = null;
 let archiveSource = null;
 let archiveStep = '';
 let registeredUnitSignature = '';
+// Opening, refreshing, or switching chats must never write the chat file.
+// SillyTavern's saveMetadataSafe() delegates to saveChatConditional(), so an
+// innocent-looking metadata save is a real chat-file write. Keep a hard
+// read-only boundary around all passive refresh paths.
+let chatWriteBlockDepth = 0;
+async function withChatWritesBlocked(fn) {
+    chatWriteBlockDepth++;
+    try { return await fn(); }
+    finally { chatWriteBlockDepth = Math.max(0, chatWriteBlockDepth - 1); }
+}
+async function saveMetadataSafe() {
+    if (chatWriteBlockDepth > 0) {
+        Debug.debug('CHAT_SAVE_BLOCKED', 'Blocked a chat metadata save during passive refresh.');
+        return false;
+    }
+    await saveMetadataHost();
+    return true;
+}
+
 const clone = value => JSON.parse(JSON.stringify(value));
 const CHAT_SETTINGS = new Set(['lorebook', 'memoryBook', 'memoryTarget', 'memoryFrom', 'memoryTo']);
 
@@ -53,13 +75,58 @@ function assertCurrentChat() {
     if (operationChat && (operationChat !== getContext().chat || operationRevision !== chatRevision)) throw new Error('The chat changed. Reopen the original chat and run the operation again.');
 }
 
-const worldInfoIO = createWorldInfoIO({ requestHeaders: getRequestHeaders, cache: worldInfoCache, assert: assertCurrentChat,
-    onSaved: (name, data) => eventSource.emit(event_types.WORLDINFO_UPDATED, name, data) });
-const readFresh = worldInfoIO.readFresh;
+const databaseIO = createDatabaseIO({requestHeaders:getRequestHeaders,assert:assertCurrentChat});
+function legacyNames() {
+    const s=settings(), archive=s.lorebook;
+    const known=new Set([archive,...Object.keys(s.storyBooks||{}),...Object.values(s.storyBooks||{}).flatMap(b=>Object.keys(b||{})),extension_settings[KEY]?.lorebook,s.memoryBook,...(archive?[memoryBookName()]:[])].filter(Boolean));
+    return getContext().getWorldInfoNames().filter(n=>known.has(n));
+}
+const databaseNames=()=>Memory.unique([...databaseIO.names(),...legacyNames()]);
+async function readLegacy(name) {
+    assertCurrentChat();
+    const response=await fetch('/api/worldinfo/get',{method:'POST',headers:getRequestHeaders(),body:JSON.stringify({name}),cache:'no-store'});
+    assertCurrentChat();if(!response.ok)throw new Error(`Legacy archive read failed: ${name} (HTTP ${response.status})`);
+    const data=await response.json();if(!data?.entries)throw new Error(`Invalid legacy archive: ${name}`);return data;
+}
+async function readFresh(name) {
+    if(!name)return null;
+    if(databaseIO.has(name))return databaseIO.readFresh(name);
+    if((extension_settings[KEY]?.standaloneArchives||[]).includes(name))throw new Error(`Standalone archive "${name}" is missing from the catalog. Restore a backup; refusing to use an outdated lorebook.`);
+    return legacyNames().includes(name)?readLegacy(name):null;
+}
+async function refreshDatabaseCatalog(){
+    await databaseIO.refresh();
+    const expected=extension_settings[KEY]?.standaloneArchives||[];
+    if(expected.some(n=>!databaseIO.has(n)))throw new Error('Standalone archive catalog is incomplete. Restore a backup before writing.');
+}
+function rememberCatalog(){extension_settings[KEY].standaloneArchives=databaseIO.names();saveSettingsDebounced();}
+function requireStandalone(){const s=settings(),name=s.lorebook;if(name&&(!databaseIO.has(name)||Object.keys(s.storyBooks?.[name]||{}).some(n=>legacyNames().includes(n)&&!databaseIO.has(n))))throw new Error('Migrate this legacy archive to standalone storage first (Database → Migrate legacy archive).');}
+async function migrateStorage(){
+    if(busy)throw new Error('Pause or finish the current operation first.');
+    const archive=settings().lorebook,origin=getContext().chat,revision=chatRevision;
+    if(!archive)throw new Error('Select the archive to migrate.');
+    const data=await readFresh(archive);if(!data)throw new Error('Archive is unavailable.');
+    const names=Memory.unique([archive,...Object.keys(settings().storyBooks?.[archive]||{}),...Object.keys(data.sceneArchivistStory?.books||{}),memoryBookName()]).filter(n=>!databaseIO.has(n)&&legacyNames().includes(n));
+    if(!names.length){toastr.info('This archive already uses standalone storage.');return;}
+    const approved=await callGenericPopup(esc(`Copy ${names.length} existing archive file(s) into standalone database storage? Original lorebooks are not edited or deleted. Existing records, jobs, and source IDs are preserved.`),POPUP_TYPE.CONFIRM,'',{okButton:'Migrate archive'});
+    if(approved!==true&&approved!==POPUP_RESULT.AFFIRMATIVE)return;
+    if(origin!==getContext().chat||revision!==chatRevision||archive!==settings().lorebook||busy)throw new Error('Chat or archive changed. Reopen the original database.');
+    busy=true;operationChat=origin;operationRevision=revision;
+    try{
+        const books=Object.fromEntries(await Promise.all(names.map(async n=>[n,await readLegacy(n)])));
+        await refreshDatabaseCatalog();await databaseIO.createMany(books);rememberCatalog();
+        // Verify the actual standalone copies again, then remove only an old managed chat binding.
+        for(const [n,d] of Object.entries(books))if(!Journal.same(d,await databaseIO.readFresh(n)))throw new Error('Migrated data verification failed. Original lorebooks were not modified.');
+        assignChatLorebook(archive);await saveMetadataSafe();
+        toastr.success(`Migrated ${names.length} archive file(s). Legacy copies remain unchanged.`);
+    }finally{busy=false;operationChat=null;}
+    await refreshChatUi();
+}
 async function saveConfirmed(name, data) {
     try {
-        if (!pendingUndo) return await worldInfoIO.saveConfirmed(name, data);
-        const existing = getContext().getWorldInfoNames().includes(name);
+        if(!databaseIO.has(name))throw new Error(`Migrate legacy archive "${name}" before writing.`);
+        if (!pendingUndo) return await databaseIO.saveConfirmed(name, data);
+        const existing = databaseIO.has(name);
         const current = existing ? await readFresh(name) : { entries: {} };
         for (const c of Journal.entryChanges(current, data)) {
             const entry = data.entries[c.key], r = Memory.record(entry); if (!r) continue;
@@ -69,8 +136,8 @@ async function saveConfirmed(name, data) {
         if (name === settings().lorebook && data.sceneArchivistStory?.shared) data.sceneArchivistStory.books = { ...(data.sceneArchivistStory.books || {}), ...(settings().storyBooks?.[name] || {}), [name]: 'archive' };
         if (pendingUndo.bases[name] && Memory.bookHash(current) !== pendingUndo.bases[name]) throw new Error(`"${name}" changed immediately before saving. Reopen the review.`);
         Journal.stageWrite(pendingUndo.journal, name, current, data);
-        await saveMetadata();
-        const actual = await worldInfoIO.saveConfirmed(name, data);
+        await saveMetadataSafe();
+        const actual = await databaseIO.saveConfirmed(name, data);
         Journal.confirmWrite(pendingUndo.journal, name, actual);
         pendingUndo.bases[name] = Memory.bookHash(actual);
         await persistMeta();
@@ -79,13 +146,9 @@ async function saveConfirmed(name, data) {
     catch (error) { toastr.error(error.message, 'Scene Archivist'); throw error; }
 }
 async function createBookConfirmed(name) {
-    if (!name) return false;
-    if (await getSanitizedFilename(name) !== name) throw new Error('Use a lorebook name without unsupported filename characters.');
-    await updateWorldInfoList();
-    if (getContext().getWorldInfoNames().includes(name)) return false;
-    await saveConfirmed(name, { entries: {} });
-    await updateWorldInfoList();
-    return true;
+    if (!name || !name.trim()) return false;
+    if (databaseNames().includes(name)) return false;
+    await refreshDatabaseCatalog();await databaseIO.createMany({[name]:{entries:{}}});rememberCatalog();return true;
 }
 const reviewCancelLabel = () => workbench?.state().job?.status === 'running' ? 'Review later' : 'Cancel';
 
@@ -119,6 +182,27 @@ function settings() {
     if (LEGACY_CONDENSE_PROMPTS.includes(cur.condensePrompt)) delete cur.condensePrompt;
     if (!('archiveRecapPrompt' in cur)) cur.archiveRecapPrompt = Memory.recapWritingPrompt(cur);
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) if (!(k in cur)) cur[k] = (v && typeof v === 'object') ? JSON.parse(JSON.stringify(v)) : v;
+    Debug.configure(cur.debugLogging);
+    // Database edition: preserve legacy records but never run duplicate memory/state systems.
+    cur.databaseOnly = true;
+    cur.memoryAuto = false;
+    cur.trackerAuto = false;
+    cur.recall = false;
+    cur.hideArchived = false;
+    cur.keepDays = 0;
+    for (const tracker of cur.trackers || []) tracker.enabled = false;
+    (cur.workbench ??= {}).memoryTools = true;
+    cur.workbench.preciseDelivery = false;
+    cur.workbench.cacheLayers = false;
+    if (!cur.databaseModeInitialized) {
+        cur.remindEvery = Number(cur.remindEvery) > 0 ? Number(cur.remindEvery) : 12;
+        cur.promptId = 'scenelog';
+        cur.unit = 'Scene';
+        cur.prompt = Core.unitize(DEFAULT_PROMPT, 'Scene');
+        cur.autoArchive = false; // notify first; user can opt into automatic scanning
+        cur.databaseModeInitialized = true;
+    }
+
     const units = [cur.unit, ...cur.promptLibrary.map(p => p.unit)].filter(Boolean);
     const unitSignature = JSON.stringify(units);
     if (unitSignature !== registeredUnitSignature) { Core.registerUnits(units); registeredUnitSignature = unitSignature; }
@@ -142,7 +226,7 @@ function settings() {
         set(target, key, value) {
             if (CHAT_SETTINGS.has(key)) {
                 chatSettings(target)[key] = value;
-                void saveMetadata().catch(e => console.error(LOG, 'Could not save chat settings', e));
+                void saveMetadataSafe().catch(e => Debug.error('CHAT_SETTINGS_SAVE_FAILED', 'Could not save chat-scoped Scene Archivist settings.', e));
             } else {
                 const overrides = presetKeys.has(key) ? activeWorkflow(target)?.settings : null;
                 if (overrides) overrides[key] = value;
@@ -202,6 +286,13 @@ function refreshScopedControls() {
         sa_archive_cond_prompt: 'archiveCondensePrompt', sa_mem_shorten_prompt: 'memoryShortenPrompt',
         sa_recall_msgs: 'recallMessages', sa_recall_max: 'recallMax', sa_keepvis: 'keepVisible', sa_tr_days: 'trackerDays' };
     for (const [id, key] of Object.entries(fields)) $('#' + id).val(s[key]);
+    $('#sa_rate_rpm').val(normalizeRPM(s.requestsPerMinute));
+    $('#sa_message_actions').prop('checked', s.showMessageActions === true);
+    $('#sa_remind').val(s.remindEvery);
+    $('#sa_autoarch').prop('checked', s.autoArchive);
+    syncCadenceControls();
+    refreshProfileList();
+    renderPacing();
     $('#sa_archive_recap_prompt').val(Memory.recapWritingPrompt(s));
     for (const [id, key] of Object.entries({ sa_mem_auto: 'memoryAuto', sa_tr_auto: 'trackerAuto', sa_recall: 'recall', sa_review: 'review', sa_hide: 'hideArchived' })) $('#' + id).prop('checked', s[key]);
     $('.sa-d-outlet').toggle(s.delivery === 'outlet');
@@ -243,8 +334,8 @@ function autoAvoid() {
 }
 const avoidList = () => [...new Set([...settings().avoid.split(',').map(x => x.trim()).filter(Boolean), ...autoAvoid()])];
 const esc = (t) => $('<div>').text(String(t ?? '')).html();
-const lorebookNames = () => getContext().getWorldInfoNames().filter(n => !n.endsWith(UNDO_SUFFIX));
-const hasBackup = (name) => !!name && getContext().getWorldInfoNames().includes(name + UNDO_SUFFIX);
+const lorebookNames = () => databaseNames().filter(n => !n.endsWith(UNDO_SUFFIX));
+const hasBackup = (name) => !!name && databaseNames().includes(name + UNDO_SUFFIX);
 
 function setStatus(items) {
     const ul = items.map(i => `<li class="sa-${i.level}">${esc(i.text)}</li>`).join('');
@@ -260,7 +351,8 @@ async function refreshLorebookList(selectName) {
     sel.append('<option value="">(none selected)</option>');
     for (const n of names) sel.append($('<option>').val(n).text(n));
     if (selectName) { s.lorebook = selectName; registerStoryBook(selectName, selectName, 'archive'); }
-    if (s.lorebook && !names.includes(s.lorebook)) s.lorebook = '';
+    if (s.lorebook && !names.includes(s.lorebook)) sel.append($('<option>').val(s.lorebook).text(s.lorebook+' (unavailable)'));
+    $('#sa_migrate_storage').prop('hidden', !s.lorebook || (databaseIO.has(s.lorebook)&&!Object.keys(s.storyBooks?.[s.lorebook]||{}).some(n=>legacyNames().includes(n)&&!databaseIO.has(n))));
     sel.val(s.lorebook);
     await updateInfoLine();
 }
@@ -268,25 +360,25 @@ async function refreshLorebookList(selectName) {
 async function updateInfoLine() {
     const s = settings();
     $('#sa_undo').prop('disabled', !undoBooks().length);
-    if (!s.lorebook) { $('#sa_info').text(names0() ? 'Pick a lorebook, or create one below.' : 'No lorebooks exist yet. Create one below.'); return; }
+    if (!s.lorebook) { $('#sa_info').text(names0() ? 'Select a database, or create one below.' : 'No databases exist yet. Create one below.'); return; }
     const data = await readFresh(s.lorebook);
-    if (!data) { $('#sa_info').text('Could not load this lorebook.'); return; }
+    if (!data) { $('#sa_info').text('Could not load this database.'); return; }
     $('#sa_undo').prop('disabled', !undoBooks().length);
     const sum = Core.managedSummary(data);
     const memThrough = Number(s.memoryProgress?.[s.lorebook] ?? 0);
     const u = s.unit || 'Day';
-    $('#sa_info').text(sum.total ? `${sum.total} log entries: ${sum.constant} always on, ${sum.keyed} keyed. Latest ${u}: ${sum.lastDay || 'none'}. Check Characters for source-by-source memory coverage.` : 'This lorebook has no Scene Log yet. The first run will create it.');
+    $('#sa_info').text(sum.total ? `${sum.total} archive entries. Latest ${u}: ${sum.lastDay || 'none'}. ${databaseIO.has(s.lorebook)?'Standalone storage':'Legacy storage: migrate before writing'}.` : 'This database is empty. The first scan will populate it.');
 }
 const names0 = () => lorebookNames().length > 0;
 
 async function createLorebook() {
     if (busy) return;
     const name = String($('#sa_newname').val() ?? '').trim();
-    if (!name) { toastr.warning('Type a name for the new lorebook first.'); return; }
-    if (lorebookNames().includes(name)) { toastr.info('That lorebook already exists, so I selected it.'); await refreshLorebookList(name); saveSettingsDebounced(); return; }
+    if (!name) { toastr.warning('Type a name for the new database first.'); return; }
+    if (lorebookNames().includes(name)) { toastr.info('That database already exists, so I selected it.'); await refreshLorebookList(name); saveSettingsDebounced(); return; }
     const ok = await createBookConfirmed(name);
-    if (!ok) { toastr.error('Could not create the lorebook.'); return; }
-    await updateWorldInfoList();
+    if (!ok) { toastr.error('Could not create the database.'); return; }
+    await refreshDatabaseCatalog();
     await refreshLorebookList(name);
     saveSettingsDebounced();
     toastr.success(`Created "${name}". Run the archivist to fill it.`);
@@ -302,7 +394,7 @@ function isLorebookActive(name) {
         if (ch?.data?.extensions?.world === name) return 'character';
         if (world_info?.charLore?.some(e => e.name === getCharaFilename(this_chid) && e.extraBooks?.includes(name))) return 'character';
         if (power_user?.persona_description_lorebook === name) return 'persona';
-    } catch (e) { console.warn(LOG, e); }
+    } catch (e) { Debug.warn('NONFATAL_OPERATION', e?.message ?? String(e), e); }
     return null;
 }
 
@@ -336,7 +428,14 @@ async function checkSetup() {
     const data = await readFresh(s.lorebook);
     if (!data) { out.push({ level: 'bad', text: `Lorebook "${s.lorebook}" could not be loaded.` }); setStatus(out); return out; }
     const sum = Core.managedSummary(data);
-    out.push({ level: 'ok', text: `Lorebook "${s.lorebook}" loaded (${sum.total} log entries).` });
+    out.push({ level: 'ok', text: `Database "${s.lorebook}" loaded (${sum.total} archive records).` });
+    if (s.databaseOnly) {
+        const pending = uncoveredArchiveMessages(getContext().chat ?? [], chat_metadata?.[KEY] ?? {});
+        out.push({ level: 'ok', text: '' + (databaseIO.has(s.lorebook) ? 'Standalone archive storage is active. No lorebook is used.' : 'Legacy read-only archive: migrate before scanning or editing.') + '' });
+        out.push({ level: 'ok', text: `${pending.length} story message${pending.length === 1 ? '' : 's'} currently await scanning.` });
+        out.push({ level: getContext().isToolCallingSupported?.() ? 'ok' : 'warn', text: getContext().isToolCallingSupported?.() ? 'The current API supports Scene Archivist retrieval tools.' : 'The current API does not report tool-calling support; manual Ask/Search still works.' });
+        setStatus(out); return out;
+    }
     const act = isLorebookActive(s.lorebook);
     if (act) out.push({ level: 'ok', text: `The lorebook is active for this chat (${act}).` });
     else out.push({ level: 'warn', text: 'The lorebook is not active for this chat, so the model will not see it. Use "Attach to this chat" below, or add it as a global lorebook.' });
@@ -385,27 +484,22 @@ async function fixOutlet() {
     }
     n += Core.convertDelivery(data, o);
     await saveConfirmed(s.lorebook, data);
-    try { reloadEditor(s.lorebook); } catch { /* editor closed */ }
+    /* Standalone archive has no World Info editor. */
     toastr.success(n ? `Updated ${n} settings on log entries.` : 'Nothing to fix.');
     await checkSetup();
 }
 
 function assignChatLorebook(name) {
-    const previous = chat_metadata[METADATA_KEY];
-    if (previous && previous !== name && !settings().storyBooks?.[previous]) meta().priorChatLorebook = previous;
-    chat_metadata[METADATA_KEY] = name;
+    // Clear only an old Archivist attachment; never attach a standalone database.
+    const previous=chat_metadata[METADATA_KEY],known=settings().storyBooks||{};
+    if(previous&&(previous===name||Object.hasOwn(known,previous)||Object.values(known).some(b=>Object.hasOwn(b||{},previous)))){
+        const prior=meta().priorChatLorebook;
+        if(prior&&prior!==previous&&getContext().getWorldInfoNames().includes(prior)&&!Object.hasOwn(known,prior))chat_metadata[METADATA_KEY]=prior;
+        else delete chat_metadata[METADATA_KEY];
+        $('.chat_lorebook_button').toggleClass('world_set',!!chat_metadata[METADATA_KEY]);
+    }
 }
-
-async function attachToChat() {
-    if (busy) return;
-    const s = settings();
-    if (!s.lorebook) { toastr.warning('Pick a lorebook first.'); return; }
-    assignChatLorebook(s.lorebook);
-    await saveMetadata();
-    $('.chat_lorebook_button').addClass('world_set');
-    toastr.success(`"${s.lorebook}" is now this chat's lorebook.`);
-    await checkSetup();
-}
+async function attachToChat(){assignChatLorebook(settings().lorebook);await saveMetadataSafe();}
 
 // ---------------------------------------------------------------- keywords
 
@@ -427,7 +521,7 @@ async function fillKeys(plan, data, supplied = null) {
             if (!ai) plan.warnings.push('The keyword request did not return usable JSON, so automatic keywords were used.');
         } catch (e) {
             if (workbench?.queue.running && workbench.liveState().job?.status !== 'running') throw e;
-            console.warn(LOG, 'keyword generation failed', e);
+            Debug.warn('KEYWORD_GENERATION_FAILED', 'Keyword generation failed; evidence saving can continue without AI keywords.', e);
             plan.warnings.push('The keyword request failed (' + (e?.message ?? e) + '), so automatic keywords were used.');
         }
     }
@@ -502,7 +596,7 @@ async function persistMeta() {
     if (pendingUndo && pendingUndo.journal.status !== 'undone') {
         pendingUndo.journal.progress.after = progressSnapshot(); pendingUndo.journal.visibilityAfter = visibilitySnapshot();
     }
-    await saveMetadata();
+    await saveMetadataSafe();
 }
 function beginUndoWrite() {
     assertCurrentChat();
@@ -520,7 +614,7 @@ async function saveUndoSnapshot(name, data) {
     assertCurrentChat();
     if (!pendingUndo) throw new Error('No journal was started.');
     pendingUndo.bases[name] = Memory.bookHash(data);
-    await saveMetadata();
+    await saveMetadataSafe();
     $('#sa_undo').prop('disabled', !undoBooks().length);
 }
 const latestJournal = () => [...(chat_metadata?.[KEY]?.journals || [])].reverse().find(j => j.archive === settings().lorebook && j.status !== 'undone' && (j.changes.some(c => c.status !== 'undone') || ['entries undone', 'restoring progress', 'undoing'].includes(j.status)));
@@ -532,11 +626,11 @@ async function undoLast() {
     busy = true; operationChat = getContext().chat; operationRevision = chatRevision; pendingUndo = null;
     try {
         const load = async () => {
-            await updateWorldInfoList();
+            await refreshDatabaseCatalog();
             const archive = settings().lorebook, data = await readFresh(archive);
             if (!data) throw new Error('Select the original archive before opening Undo.');
             const names = Memory.unique([...Object.keys(journal.receipts), ...Object.keys(settings().storyBooks?.[archive] || {}), ...Object.keys(data.sceneArchivistStory?.books || {}), archive, memoryBookName()]);
-            const available = getContext().getWorldInfoNames();
+            const available = databaseNames();
             // A missing managed book could contain a dependent. Do not guess that it is empty.
             const managed = names.filter(n => n !== memoryBookName() || available.includes(n) || Object.hasOwn(journal.receipts, n) || Object.hasOwn(data.sceneArchivistStory?.books || {}, n));
             return Object.fromEntries(await Promise.all(managed.map(async n => [n, n === archive ? data : await readFresh(n)])));
@@ -552,18 +646,18 @@ async function undoLast() {
         const fresh = await load(), final = Journal.planUndo(journal, fresh);
         if (!Journal.same(final.safe.map(c => [c.book, c.key]).sort(), plan.safe.map(c => [c.book, c.key]).sort())) throw new Error('The Undo plan changed while you reviewed it. Reopen Undo.');
         const desired = Journal.applyUndo(fresh, final);
-        journal.status = 'undoing'; await saveMetadata();
+        journal.status = 'undoing'; await saveMetadataSafe();
         // Removing derived books first leaves source entries available after an interrupted Undo.
         const touched = Memory.unique([...final.safe.map(c => c.book), ...final.already.map(c => c.book), ...(final.complete ? Object.keys(journal.receipts) : [])]).sort((a, b) => (a === settings().lorebook ? 1 : 0) - (b === settings().lorebook ? 1 : 0));
         for (const name of touched) {
             const latest = await readFresh(name);
             if (!Journal.same(latest, fresh[name])) throw new Error(`"${name}" changed immediately before Undo. Reopen Undo to continue safely.`);
-            if (!Journal.same(latest, desired[name])) await worldInfoIO.saveConfirmed(name, desired[name]);
-            Journal.confirmUndo(journal, name, await readFresh(name), final); await saveMetadata();
-            try { reloadEditor(name); } catch { /* editor closed */ }
+            if (!Journal.same(latest, desired[name])) await databaseIO.saveConfirmed(name, desired[name]);
+            Journal.confirmUndo(journal, name, await readFresh(name), final); await saveMetadataSafe();
+            /* Standalone archive has no World Info editor. */
         }
         if (journal.changes.every(c => c.status === 'undone')) {
-            journal.status = 'restoring progress'; await saveMetadata();
+            journal.status = 'restoring progress'; await saveMetadataSafe();
             const current = progressSnapshot(), before = journal.progress.before, after = journal.progress.after;
             // Restore only fields that still equal this job's recorded after-state.
             for (const key of ['ranges', 'archivedThrough', 'lastDay', 'at', 'messages']) if (Journal.same(current[key], after[key])) meta()[key] = clone(before[key]);
@@ -582,7 +676,7 @@ async function undoLast() {
             if (job?.id === journal.id) { job.status = 'canceled'; job.error = 'This job was undone.'; }
         }
         if (journal.changes.every(c => c.status === 'undone')) journal.status = 'undone';
-        saveSettingsDebounced(); await saveMetadata();
+        saveSettingsDebounced(); await saveMetadataSafe();
         toastr.success(journal.status === 'undone' ? 'The job was undone. Later unrelated records were kept.' : 'Safe changes were undone. Conflicting work and its progress were kept.');
     } catch (e) { if (journal.changes.every(c => c.status === 'undone')) journal.status = 'restoring progress'; toastr.error('Undo is incomplete: ' + e.message); }
     finally { busy = false; operationChat = null; }
@@ -599,7 +693,7 @@ async function commit(plan, parsed, name, expectedHash = '') {
     const before = clone(data);
     if (archiveSource && !Memory.checkSource(archiveSource, workbench?.sourceId() || archiveSource.chatId, getContext().chat || []).valid) throw new Error('The transcript changed while the output was being reviewed. No archive write was made.');
     await saveUndoSnapshot(name, data);
-    const makeEntry = (d) => createWorldInfoEntry(name, d);
+    const makeEntry = (d) => makeDatabaseEntry(name, d);
     const rep = Core.applyPlan(data, plan, parsed, o, makeEntry);
     const changed = Memory.captureChanges(data, before, Core.classifyEntry, { storyId: workbench?.state().storyId || '', source: archiveSource || undefined, reason: 'Archive write' });
     for (const e of Object.values(data.entries)) if (Memory.record(e)?.storyId === (workbench?.state().storyId || '')) e.sceneArchivistArchive = name;
@@ -607,11 +701,11 @@ async function commit(plan, parsed, name, expectedHash = '') {
     if (archiveStep) data.sceneArchivistReceipts = Memory.unique([...(data.sceneArchivistReceipts || []), archiveStep]);
     await saveConfirmed(name, data);
     assertCurrentChat();
-    try { reloadEditor(name); } catch { /* editor closed */ }
+    /* Standalone archive has no World Info editor. */
     const sum = Core.managedSummary(data);
     settings().lastWriteBooks = [name]; saveSettingsDebounced();
     chat_metadata[KEY] = { ...(chat_metadata[KEY] ?? {}), lastDay: sum.lastDay, at: Date.now(), messages: getContext().chat?.length ?? 0 };
-    await saveMetadata();
+    await saveMetadataSafe();
     await updateInfoLine();
     const parts = [];
     if (rep.seeded) parts.push('created the Scene Log structure');
@@ -656,22 +750,21 @@ async function handleOutput(text) {
 /** First run with no lorebook picked: make one named after the character, select it and attach it to the chat. */
 async function ensureLorebook() {
     const s = settings();
-    if (s.lorebook) return true;
-    const base = `${getContext().name2 || 'Story'} Archive`;
+    if (s.lorebook) {requireStandalone();return true;}
+    const base = `${getContext().name2 || 'Story'} Archive DB`;
     let name = base, i = 2;
-    while (getContext().getWorldInfoNames().includes(name)) name = `${base} ${i++}`;
-    if (!(await createBookConfirmed(name))) { toastr.error('Could not create a lorebook.'); return false; }
-    await updateWorldInfoList();
+    while (databaseNames().includes(name)) name = `${base} ${i++}`;
+    if (!(await createBookConfirmed(name))) { toastr.error('Could not create the database.'); return false; }
+    await refreshDatabaseCatalog();
     await refreshLorebookList(name);
-    if (!isLorebookActive(name)) { assignChatLorebook(name); try { await saveMetadata(); } catch { /* ignore */ } $('.chat_lorebook_button').addClass('world_set'); }
     saveSettingsDebounced();
-    toastr.info(`Created "${name}" and attached it to this chat.`);
+    toastr.info(`Created "${name}" as a database. It was not attached to the RP prompt.`);
     return true;
 }
 
 async function runSummarize(opts = {}) {
     try { return await workbench.archiveWorkflow(opts?.thorough === true); }
-    catch (e) { console.error(LOG, e); toastr.error(e?.message ?? e); return false; }
+    catch (e) { Debug.error('ARCHIVE_WORKFLOW_FAILED', e?.message ?? String(e), e); toastr.error(e?.message ?? e); return false; }
 }
 
 async function pasteOutput() {
@@ -681,7 +774,7 @@ async function pasteOutput() {
     busy = true; operationChat = getContext().chat; operationRevision = chatRevision;
     const startingChat = getContext().chat, startingRevision = chatRevision;
     let wrote = false;
-    try { wrote = !!(await handleOutput(text)); } catch (e) { console.error(LOG, e); toastr.error('Failed: ' + (e?.message ?? e)); } finally { busy = false; operationChat = null; }
+    try { wrote = !!(await handleOutput(text)); } catch (e) { Debug.error('PASTED_ARCHIVE_FAILED', e?.message ?? String(e), e); toastr.error('Failed: ' + (e?.message ?? e)); } finally { busy = false; operationChat = null; }
     if ((getContext().chat !== startingChat || chatRevision !== startingRevision)) return;
     if (wrote && settings().memoryAuto) await runMemories();
     if ((getContext().chat !== startingChat || chatRevision !== startingRevision)) return;
@@ -717,6 +810,7 @@ async function copyDiagnostics() {
         `SillyTavern: ${typeof ctx.version === 'string' ? ctx.version : 'unknown'} | API: ${main_api} | ${navigator.userAgent}`,
         `Delivery: ${s.delivery} (depth ${s.depth}, role ${s.role}, outlet "${s.outlet}") | Archive mode: ${s.archiveMode} | Keywords: ${s.keyMode}`,
         `Side-call profile: ${s.sideProfile || '(current model)'} | Recall: ${s.recall ? 'on' : 'off'} | Memories auto: ${s.memoryAuto ? 'on' : 'off'} (${s.memoryTarget}${s.memoryTarget === 'separate' ? ', book "' + memoryBookName() + '", active: ' + (selected_world_info.includes(memoryBookName()) ? 'yes' : 'no') : ''})`,
+        `Scene Archivist request limit: ${normalizeRPM(s.requestsPerMinute)} RPM (0 = disabled)`,
         `Last model route: ${modelRouter.lastRoute() ? JSON.stringify(modelRouter.lastRoute()) : 'No request this session'}`,
         `Lorebook: ${s.lorebook || '(none)'} | entries: ${entries.length} | attached to chat: ${isLorebookActive(s.lorebook) ? 'yes' : 'no'}`,
         `Prompt: ${s.promptId} (${String(s.prompt ?? '').length} chars) | model-aware range processing | auto-hide ${s.hideArchived ? 'on, keep ' + s.keepVisible : 'off'}`,
@@ -733,10 +827,38 @@ function extractCompletion(data, api) {
     return completionReply(data, text);
 }
 
+// One shared gate for every Scene Archivist model request, including repairs and tests.
+const rateStorage = 'sceneArchivist.requestPacing.v1';
+let pacingText = '';
+function renderPacing() { document.querySelectorAll('[data-sa-pacing-status]').forEach(node => { node.textContent = pacingText; }); }
+const requestLimiter = new RequestLimiter({
+    rpm: () => extension_settings[KEY]?.requestsPerMinute,
+    load: () => JSON.parse(sessionStorage.getItem(rateStorage) || '{}'),
+    save: value => sessionStorage.setItem(rateStorage, JSON.stringify(value)),
+    report: state => {
+        const previous = pacingText;
+        pacingText = state.state === 'waiting' ? `${state.cooldown ? 'Provider cooldown' : 'Rate limiting'}: next request in ${state.seconds}s. Pause stops the pending request.`
+            : state.state === 'sending' ? 'Model request in progress.'
+            : state.cooldownUntil > Date.now() ? `Provider cooldown until ${new Date(state.cooldownUntil).toLocaleTimeString()}.` : '';
+        if (pacingText !== previous) renderPacing();
+        if (state.state === 'idle' && state.cooldownUntil > Date.now() && pacingText !== previous) Debug.warn('PROVIDER_COOLDOWN', 'Provider rate limit; queued requests will wait until cooldown ends.', { until: new Date(state.cooldownUntil).toISOString() });
+    },
+});
+function pacedRequest(send) {
+    const chat = getContext().chat, revision = chatRevision;
+    const job = workbench?.queue.running ? workbench.liveState().job : null;
+    return requestLimiter.run(send, () => {
+        assertCurrentChat();
+        if (chat !== getContext().chat || revision !== chatRevision || (job && (workbench.liveState().job !== job || job.status !== 'running'))) throw new Error('Chat changed or job paused/canceled.');
+    });
+}
+
 const modelRouter = createModelRouter({
     describe: flowModelInfo,
     assert: assertCurrentChat,
-    current: async req => {
+    current: req => pacedRequest(async () => {
+        const route = flowModelInfo('');
+        Debug.info('MODEL_DISPATCH', 'Sending to current SillyTavern connection.', { provider: route.provider, model: route.model, maxTokens: req.maxTokens });
         const options = { prompt: req.assembled ?? req.prompt,
             systemPrompt: req.assembled ? '' : req.system, responseLength: req.maxTokens };
         if ((req.preserveJson || req.includeFinishReason) && typeof Host.generateRawData === 'function' && typeof Host.extractMessageFromData === 'function') {
@@ -745,28 +867,38 @@ const modelRouter = createModelRouter({
             return req.includeFinishReason ? reply : reply.content;
         }
         return generateRaw(options);
-    },
-    sendProfile: async (profile, messages, maxTokens, includeFinishReason) => {
+    }),
+    sendProfile: (profile, messages, maxTokens, includeFinishReason, request) => pacedRequest(async () => {
+        const route = flowModelInfo(profile);
+        Debug.info('MODEL_DISPATCH', 'Sending to selected connection profile.', { profile, provider: route.provider, model: route.model, maxTokens });
         const service = getContext().ConnectionManagerRequestService;
         if (!service?.sendRequest) throw new Error('Connection Manager is unavailable. Re-enable it or choose another connection.');
         if (includeFinishReason && typeof Host.extractMessageFromData === 'function') {
             const { api } = flowModelInfo(profile);
-            const data = await service.sendRequest(profile, messages, maxTokens, { extractData: false });
+            let override={};
+            if(isGLMDiaryProfile(route,request)){
+                const ctx=getContext(), selected=ctx.extensionSettings?.connectionManager?.profiles?.find(p=>p.id===profile);
+                const source=optionalProfilePreset(ctx,api,selected?.preset)||{};
+                const custom={custom_include_body:Host.substituteParams(source.custom_include_body||''),custom_exclude_body:Host.substituteParams(source.custom_exclude_body||'')};
+                override=diaryProfileOverride(route,request,custom,yaml.parse,yaml.stringify);
+                Debug.info('DIARY_REASONING','Using low reasoning effort for this GLM diary request only.');
+            }
+            const data = await service.sendRequest(profile, messages, maxTokens, { extractData: false }, override);
             return extractCompletion(data, api);
         }
         return service.sendRequest(profile, messages, maxTokens);
-    },
+    }),
 });
 
 /** A chosen profile is pinned to this request. A failed profile never changes the route. */
-async function sideCall({ prompt, system = '', maxTokens = 1200 }, profile = settings().sideProfile || '') {
-    return modelRouter.request({ prompt, system, maxTokens }, profile);
+async function sideCall({ prompt, system = '', maxTokens = 1200, preserveJson = false }, profile = settings().sideProfile || '') {
+    return modelRouter.request({ prompt, system, maxTokens, preserveJson }, profile);
 }
 
 function refreshProfileList() {
     const s = settings();
     const profiles = getContext().extensionSettings?.connectionManager?.profiles ?? [];
-    for (const [selector, setting] of [['#sa_side_profile', 'sideProfile'], ['#sa_archive_profile', 'archiveProfile']]) {
+    for (const [selector, setting] of [['#sa_side_profile', 'sideProfile'], ['#sa_archive_profile', 'archiveProfile'], ['#sa_diary_profile', 'diaryProfile']]) {
         const select = $(selector);
         select.empty().append($('<option>').val('').text('Current SillyTavern model'));
         for (const profile of profiles) select.append($('<option>').val(profile.id).text(profile.name));
@@ -799,14 +931,18 @@ async function readDiaryLore(card) {
 
 function flowModelInfo(profile) {
     const current = getContext();
-    if (!profile) return { name: String(current.getCurrentModel?.() || (main_api === 'openai' ? oai_settings.openai_model : '') || 'Current SillyTavern model'), context: getMaxContextTokens(), output: getMaxResponseTokens() };
+    if (!profile) {
+        const provider = main_api === 'openai' ? oai_settings.chat_completion_source : main_api;
+        const model = main_api === 'openai' ? getChatCompletionModel(oai_settings) : current.getCurrentModel?.();
+        return { name: String(model || 'Current SillyTavern model'), model: String(model || 'Provider-selected model'), provider, api: main_api, context: getMaxContextTokens(), output: getMaxResponseTokens() };
+    }
     const selected = current.extensionSettings?.connectionManager?.profiles?.find(p => p.id === profile);
     if (!selected) throw new Error('The selected connection profile is unavailable. Choose an available profile or retry on the current model.');
     const api = current.CONNECT_API_MAP?.[selected.api]?.selected || 'openai';
-    const preset = current.getPresetManager?.(api)?.getCompletionPresetByName?.(selected.preset);
+    const preset = optionalProfilePreset(current, api, selected.preset);
     const context = api === 'textgenerationwebui' ? preset?.max_length : preset?.openai_max_context;
     const output = api === 'textgenerationwebui' ? preset?.genamt : preset?.openai_max_tokens;
-    return { name: selected.name, api, context: Number(context || selected.context_length) || 0,
+    return { name: selected.name, model: String(selected.model || 'Provider-selected model'), provider: current.CONNECT_API_MAP?.[selected.api]?.source || selected.api, api, context: Number(context || selected.context_length) || 0,
         output: Number(output || selected.max_tokens) || 0 };
 }
 
@@ -831,13 +967,19 @@ async function sendFlowRequest(req, profile) {
     return modelRouter.request(req, profile || '');
 }
 
-async function testSide() {
+async function testProfile(setting, title) {
+    if (busy) { toastr.info('Pause or finish the current Scene Archivist operation before testing a connection.'); return; }
     try {
-        const profile = settings().sideProfile || '', name = flowModelInfo(profile).name;
+        const profile = settings()[setting] || '', name = flowModelInfo(profile).name;
         const out = await sideCall({ prompt: 'Reply with the single word: ready', maxTokens: 30 }, profile);
-        toastr.success(name + ' answered: ' + String(out).trim().slice(0, 60), 'Helper connection test');
-    } catch (e) { toastr.error('The helper connection failed: ' + (e?.message ?? e)); }
+        toastr.success(name + ' answered: ' + String(out).trim().slice(0, 60), title + ' connection test');
+    } catch (e) {
+        Debug.error('PROFILE_TEST_FAILED', `${title} connection test failed.`, { message: e?.message ?? String(e), setting, causes: errorDetails(e) });
+        toastr.error(`The ${title.toLocaleLowerCase()} connection failed: ` + (e?.message ?? e));
+    }
 }
+async function testSide() { return testProfile('sideProfile', 'Database extraction'); }
+async function testDiary() { return testProfile('diaryProfile', 'Diary'); }
 
 // ---------------------------------------------------------------- what the model saw
 
@@ -865,7 +1007,7 @@ async function onWorldInfoActivated(entries) {
         }
         lastView = { at: Date.now(), items };
         await renderView();
-    } catch (e) { console.warn(LOG, 'viewer', e); }
+    } catch (e) { Debug.warn('VIEWER_FAILED', 'Could not open the requested evidence viewer.', e); }
 }
 
 async function renderView() {
@@ -897,7 +1039,7 @@ async function afterArchive(range, days, hideOverride = null) {
     for (const r of range.ranges ?? [range]) {
         let hidden = false, hiddenTo = null;
         if (range.stepId && meta().ranges?.some(x => x.stepId === range.stepId && x.from === r.from && x.to === r.to)) continue;
-        if (hideOverride ?? s.hideArchived) {
+        if (!s.databaseOnly && (hideOverride ?? s.hideArchived)) {
             const keep = hideOverride != null ? 0 : Math.max(0, Number(s.keepVisible) || 0);
             const hideTo = Math.min(r.to, chat.length - 1 - keep);
             if (hideTo >= r.from) { await hideChatMessageRange(r.from, hideTo, false); hidden = true; hiddenTo = hideTo; }
@@ -918,7 +1060,7 @@ async function toggleLedgerRow(i) {
     const anyVisible = chat.slice(r.from, r.to + 1).some(x => !x.is_system);
     if (!anyVisible) { await hideChatMessageRange(r.from, Math.min(r.to, chat.length - 1), true); r.hidden = false; }
     else { const to = Math.min(r.to, chat.length - 1); await hideChatMessageRange(r.from, to, false); r.hidden = true; r.hiddenTo = to; }
-    try { await saveMetadata(); } catch { /* ignore */ }
+    try { await saveMetadataSafe(); } catch { /* ignore */ }
     await renderLedger();
 }
 
@@ -936,8 +1078,7 @@ function renderLedger() {
     const remaining = `${pend.length} ${pend.length === 1 ? 'message remains' : 'messages remain'} unarchived${pend.length ? ` (about ${fmtTok(tok)} input tokens)` : ''}.`;
     sum.text(`${coverage} ${remaining}`);
     const rows = Core.ledgerRows(m);
-    list.html(rows.map(r => { const row = m.ranges[r.i]; const visible = chat.slice(row.from, row.to + 1).filter(x => !x.is_system).length; return `<div class="sa-ledgerrow"><b>Messages ${esc(r.label)}</b> <span class="sa-badge">summarized</span> <span class="sa-hint">${visible} visible / ${row.to - row.from + 1} total · ${esc(r.note.replace(/Day/g, settings().unit))}</span> <a class="sa-ledgerlink" data-i="${r.i}">${visible ? 'hide exactly this range' : 'show exactly this range'}</a><button type="button" class="menu_button" data-sa-action="ledgerForget" data-row="${r.i}">🧽 Mark unprocessed</button><button type="button" class="menu_button" data-sa-action="ledgerRedo" data-row="${r.i}">🔄 Redo summaries</button></div>`; }).join('') || '<div class="sa-hint">No summarized ranges yet. Use Pick your messages for an exact interval.</div>');
-    list.find('.sa-ledgerlink').on('click', async function () { await toggleLedgerRow(Number($(this).data('i'))); });
+    list.html(rows.map(r => { const row = m.ranges[r.i]; return `<div class="sa-ledgerrow"><b>Messages ${esc(r.label)}</b> <span class="sa-badge">scanned</span> <span class="sa-hint">${row.to - row.from + 1} source messages · ${esc(r.note.replace(/Day/g, settings().unit))}</span><button type="button" class="menu_button" data-sa-action="ledgerForget" data-row="${r.i}">🧽 Mark unprocessed</button><button type="button" class="menu_button" data-sa-action="ledgerRedo" data-row="${r.i}">🔄 Rescan evidence</button></div>`; }).join('') || '<div class="sa-hint">No scanned ranges yet. Use Pick your messages for an exact interval.</div>');
     workbench?.layout?.help.refresh(list[0]);
 }
 
@@ -950,7 +1091,7 @@ async function setThrough() {
     const allHidden = chat.slice(0, n + 1).every(x => x.is_system);
     m.archivedThrough = n;
     m.ranges = [{ from: 0, to: n, days: [], hidden: allHidden, hiddenTo: allHidden ? n : null, note: 'marked by hand' }];
-    try { await saveMetadata(); } catch { /* ignore */ }
+    try { await saveMetadataSafe(); } catch { /* ignore */ }
     await renderLedger();
     toastr.success(`Messages 0 to ${n} are now marked as archived.`);
 }
@@ -970,7 +1111,7 @@ async function importLedger() {
         return { from: r.from, to, days: [], hidden: allHidden, hiddenTo: allHidden ? to : null, note: r.note };
     });
     m.archivedThrough = Core.coverageThrough(m);
-    try { await saveMetadata(); } catch { /* ignore */ }
+    try { await saveMetadataSafe(); } catch { /* ignore */ }
     await renderLedger();
     toastr.success(`Imported ${archived.length} archived ${archived.length === 1 ? 'range' : 'ranges'}. Archived through message ${m.archivedThrough}.`);
 }
@@ -1081,6 +1222,7 @@ const memoryBookName = () => { const s = settings(); return (String(s.memoryBook
 /** Which lorebook a character's memories go to: a separate memories lorebook, the archive, or the character's own lorebook. */
 function memoryBookFor(c) {
     const s = settings();
+    if (s.databaseOnly) return s.lorebook;
     if (s.memoryTarget === 'archive') return s.lorebook;
     if (s.memoryTarget === 'character') {
         const w = findCharacter(c)?.data?.extensions?.world;
@@ -1113,36 +1255,13 @@ function storyMemoryData(data, book) {
         e.sceneArchivistArchive ? e.sceneArchivistArchive === s.lorebook : dedicated)) };
 }
 
+// Compatibility guard for old attached lorebook backups. No active database storage is delivered through World Info.
 async function onEntriesLoaded(groups) {
-    const s = settings();
-    const archive = s.lorebook;
-    const sources = ['globalLore', 'characterLore', 'chatLore', 'personaLore'];
-    for (const key of sources) {
-        const entries = groups[key];
-        if (!Array.isArray(entries)) continue;
-        for (let i = entries.length - 1; i >= 0; i--) {
-            const e = entries[i];
-            const owner = e.sceneArchivistArchive || Object.entries(s.storyBooks).find(([, books]) =>
-                books[e.world] && books[e.world] !== 'character')?.[0];
-            const kind = Core.classifyEntry(e);
-            const unscopedMemory = kind?.type === 'memory' && !owner && e.world !== archive && e.world !== memoryBookName();
-            if ((owner && owner !== archive && kind) || unscopedMemory) entries.splice(i, 1);
-        }
+    const s=settings(),managedBooks=new Set([s.lorebook,memoryBookName(),...Object.keys(s.storyBooks||{}),...Object.values(s.storyBooks||{}).flatMap(b=>Object.keys(b||{}))].filter(Boolean));
+    for(const key of ['globalLore','characterLore','chatLore','personaLore']){
+        const entries=groups[key];if(!Array.isArray(entries))continue;
+        for(let i=entries.length-1;i>=0;i--){const e=entries[i];if(Memory.record(e)||e.sceneArchivistArchive||(managedBooks.has(e.world)&&Core.classifyEntry(e)))entries.splice(i,1);}
     }
-    if (!archive || !isLorebookActive(archive) || !Array.isArray(groups.chatLore)) return;
-    const seen = new Set(sources.flatMap(k => groups[k] ?? []).map(e => `${e.world}::${e.uid}`));
-    const books = new Set([memoryBookName(), ...Object.keys(s.storyBooks[archive] ?? {})]);
-    for (const book of books) {
-        if (book === archive || !getContext().getWorldInfoNames().includes(book)) continue;
-        const data = await readFresh(book);
-        if (settings().lorebook !== archive) return;
-        for (const e of Object.values(storyMemoryData(data ?? {}, book).entries ?? {})) {
-            if ((!Memory.record(e) && Core.classifyEntry(e)?.type !== 'memory') || seen.has(`${book}::${e.uid}`)) continue;
-            groups.chatLore.push({ ...e, world: book });
-            seen.add(`${book}::${e.uid}`);
-        }
-    }
-    if (workbench) await workbench.filterEntries(groups);
 }
 
 function mountRangeMarkers(messageIndex) {
@@ -1217,26 +1336,28 @@ function replyPreviewContext(group) {
 }
 
 async function refreshChatUi() {
-    const s = settings();
-    lastView = null; lastRemindAt = 0;
-    $('#sa_range_from, #sa_range_to').val('');
-    $('#sa_mem_book').val(s.memoryBook); $('#sa_mem_target').val(s.memoryTarget);
-    $('#sa_mem_from').val(s.memoryFrom); $('#sa_mem_to').val(s.memoryTo);
-    if (s.lorebook) {
-        registerStoryBook(s.lorebook, s.lorebook, 'archive');
-        const book = memoryBookName();
-        if (getContext().getWorldInfoNames().includes(book)) registerStoryBook(s.lorebook, book, 'separate');
-    }
-    await refreshLorebookList();
-    await saveMetadata();
-    await renderLedger(); await renderView();
-    if (workbench) {
-        refreshScopedControls();
-        workbench.syncOptions();
-        await workbench.onChatOpened();
-    }
-    chatControls?.syncRange();
-    mountRangeMarkers();
+    return withChatWritesBlocked(async () => {
+        await refreshDatabaseCatalog();
+        const s = settings();
+        lastView = null; lastRemindAt = 0;
+        $('#sa_range_from, #sa_range_to').val('');
+        $('#sa_mem_book').val(s.memoryBook); $('#sa_mem_target').val(s.memoryTarget);
+        $('#sa_mem_from').val(s.memoryFrom); $('#sa_mem_to').val(s.memoryTo);
+        if (s.lorebook) {
+            registerStoryBook(s.lorebook, s.lorebook, 'archive');
+            const book = memoryBookName();
+            if (databaseNames().includes(book)) registerStoryBook(s.lorebook, book, 'separate');
+        }
+        await refreshLorebookList();
+        await renderLedger(); await renderView();
+        if (workbench) {
+            refreshScopedControls();
+            workbench.syncOptions();
+            await workbench.onChatOpened();
+        }
+        chatControls?.syncRange();
+        mountRangeMarkers();
+    });
 }
 
 function migrateStoryBooks() {
@@ -1253,7 +1374,7 @@ function migrateStoryBooks() {
 
 async function runMemories() {
     try { return await workbench.startMemories(); }
-    catch (e) { console.error(LOG, e); toastr.error(e?.message ?? e); }
+    catch (e) { Debug.error('OPERATION_FAILED', e?.message ?? String(e), e); toastr.error(e?.message ?? e); }
 }
 
 // ---------------------------------------------------------------- trackers and recap
@@ -1276,7 +1397,7 @@ async function runTrackers(onlyId = null, quiet = false) {
     try { return await workbench.startTrackers(onlyId, quiet); }
     catch (e) {
         if (!quiet) toastr.error(e?.message ?? e);
-        console.warn(LOG, e);
+        Debug.warn('HELPER_WARNING', e?.message ?? String(e), e);
         return false;
     }
 }
@@ -1289,7 +1410,7 @@ async function recap() {
 // ---------------------------------------------------------------- Recall
 
 function recentMessages(n) {
-    const list = (getContext().chat ?? []).filter(m => !m.is_system && String(m.mes ?? '').trim());
+    const list = (getContext().chat ?? []).filter(m => Memory.storyMessage(m));
     return list.slice(-Math.max(1, n)).map(m => `${m.name}: ${String(m.mes).replace(/\s+/g, ' ').slice(0, 1200)}`).join('\n');
 }
 
@@ -1304,7 +1425,7 @@ async function runRecall() {
     const max = Math.max(1, Number(s.recallMax) || 4);
     const rp = Core.buildRecallPrompt(index, recent, max);
     const { value: ids, text } = await sideJson({ prompt: rp.prompt, system: rp.system, maxTokens: 300 }, t => Core.parseRecallResponse(t, index, max), 'recall');
-    if (ids === null) { console.warn(LOG, 'recall reply was not usable', text); return { picked: [], bad: true }; }
+    if (ids === null) { Debug.warn('RECALL_REPLY_INVALID', 'Recall helper returned an unreadable selection.', { sample: String(text).slice(0, 500) }); return { picked: [], bad: true }; }
     return { picked: index.filter(x => ids.includes(x.id)) };
 }
 
@@ -1318,7 +1439,7 @@ function showRecallResult(r) {
 
 async function onGenerationStarted(type, params, dryRun) {
     try { await workbench.beforeGeneration(type, params, dryRun); }
-    catch (e) { console.warn(LOG, e); }
+    catch (e) { Debug.warn('GENERATION_HOOK_FAILED', 'Scene Archivist generation hook failed.', e); }
 }
 
 async function testRecall() {
@@ -1337,20 +1458,55 @@ async function testRecall() {
 // ---------------------------------------------------------------- reminder
 
 let lastRemindAt = 0;
-async function onMessageReceived(index, type) {
-    workbench?.extras?.prompt.receive(index, type);
+const CADENCE_CONTROLS = '#sa_cadence_enabled, #sa_cadence_enabled_panel';
+// The hidden Switchboard bridge and the workbench checkbox share one global setting.
+// Switchboard changes the bridge through the same delegated change handler.
+export function syncCadenceControls() {
+    const s = settings();
+    const enabled = s.cadencePaused !== true;
+    const every = Math.max(0, Number(s.remindEvery) || 0);
+    const status = !enabled ? 'Paused — no automatic scans or reminders'
+        : !every ? 'Disabled — interval is 0'
+        : s.autoArchive ? `Automatic scan every ${every} messages` : `Reminder every ${every} messages`;
+    $(CADENCE_CONTROLS).prop('checked', enabled).prop('disabled', false).attr('data-sa-cadence-status', status);
+    $('#sa_cadence_status_panel').text(status);
+    $(document).trigger('sa:cadence-changed');
+}
+function bindCadenceControls() {
+    $(document).off('change.sceneArchivistCadence', CADENCE_CONTROLS)
+        .on('change.sceneArchivistCadence', CADENCE_CONTROLS, function () {
+            const s = settings(), paused = !this.checked;
+            if ((s.cadencePaused === true) !== paused) {
+                s.cadencePaused = paused;
+                // Resume checks the accumulated backlog on the next assistant reply.
+                // Never reset scan coverage or dispatch a request from a toggle.
+                lastRemindAt = 0;
+                saveSettingsDebounced();
+            }
+            syncCadenceControls();
+            workbench?.layout?.refresh();
+        });
+    syncCadenceControls();
+}
+async function onMessageReceived() {
     try {
         const s = settings();
-        const every = Number(s.remindEvery) || 0;
-        if (!every || busy) return;
-        const len = getContext().chat?.length ?? 0;
-        const since = len - (chat_metadata?.[KEY]?.messages ?? 0);
-        if (since < every || len - lastRemindAt < every) return;
-        lastRemindAt = len;
-        if (s.autoArchive) { await runSummarize(); return; }
-        toastr.info(`${since} messages since the last archive. Click here to archive now.`, 'Scene Archivist', { timeOut: 20000, onclick: () => runSummarize() });
-    } catch (e) { console.warn(LOG, e); }
-    finally { if (workbench) await workbench.afterReply().catch(e => console.warn(LOG, e)); }
+        const every = Math.max(0, Number(s.remindEvery) || 0);
+        if (!s.databaseOnly || s.cadencePaused === true || !every || busy || !s.lorebook) return;
+        const chat = getContext().chat ?? [];
+        const pending = uncoveredArchiveMessages(chat, chat_metadata?.[KEY] ?? {});
+        if (pending.length < every || chat.length - lastRemindAt < every) return;
+        lastRemindAt = chat.length;
+        if (s.autoArchive) { await runSummarize({ batch: true }); return; }
+        const origin = getContext().chat, revision = chatRevision, archive = s.lorebook;
+        toastr.info(`${pending.length} story messages are waiting in Scene Archivist. Click to batch-scan them.`, 'Scene Archivist', {
+            timeOut: 20000, onclick: () => {
+                const current = settings();
+                if (current.cadencePaused === true || !Number(current.remindEvery) || current.lorebook !== archive || origin !== getContext().chat || revision !== chatRevision) return;
+                return runSummarize({ batch: true });
+            },
+        });
+    } catch (e) { Debug.warn('NONFATAL_OPERATION', e?.message ?? String(e), e); }
 }
 
 // ---------------------------------------------------------------- UI
@@ -1360,10 +1516,10 @@ function panelHtml() {
 <div class="sa-panel">
     <div class="sa-title">🗂️ Scene Archivist <span class="sa-ver">v${VERSION}</span></div>
     <div class="sa-hero">
-      <div class="sa-row"><select id="sa_lorebook" class="text_pole" title="The lorebook that holds your Scene Log"></select></div>
-      <div class="sa-row"><input id="sa_newname" class="text_pole" type="text" placeholder="New lorebook name"><input id="sa_create" class="menu_button" type="button" value="Create"></div>
+      <div class="sa-row"><select id="sa_lorebook" class="text_pole" title="Standalone evidence database"></select></div>
+      <div class="sa-row"><input id="sa_newname" class="text_pole" type="text" placeholder="New database name"><input id="sa_create" class="menu_button" type="button" value="Create"><input id="sa_migrate_storage" class="menu_button" type="button" value="Migrate legacy archive" hidden></div>
       <div class="sa-hint" id="sa_info"></div>
-      <div class="sa-row sa-main"><input id="sa_run" class="menu_button sa-run" type="button" value="✨ Archive now" title="A quickie: summarize what is new and file it in the lorebook"><input id="sa_thorough" class="menu_button sa-run sa-run2" type="button" value="💋 Archive thoroughly" title="Takes its time and covers everything: the log, the character memories and a tidy-up"><input id="sa_paste" class="menu_button" type="button" value="📋 Paste" title="Paste an archivist reply you wrote or got elsewhere"></div>
+      <div class="sa-row sa-main"><input id="sa_run" class="menu_button sa-run" type="button" value="🗃️ Batch scan pending" title="A quickie: summarize what is new and file it in the lorebook"><input id="sa_thorough" class="menu_button sa-run sa-run2" type="button" value="🗃️ Batch scan + extract" title="Takes its time and covers everything: the log, the character memories and a tidy-up"><input id="sa_paste" class="menu_button" type="button" value="📋 Paste" title="Paste an archivist reply you wrote or got elsewhere"></div>
       <div class="sa-status" id="sa_status"></div>
       <div class="sa-row sa-mini"><input id="sa_check" class="menu_button" type="button" value="Check setup"><input id="sa_attach" class="menu_button" type="button" value="Attach to chat"><input id="sa_fix" class="menu_button" type="button" value="Fix delivery"><input id="sa_undo" class="menu_button" type="button" value="↩ Undo" title="Undo the last archive write"><input id="sa_diag" class="menu_button" type="button" value="Diagnostics" title="Copy a short report for bug reports"></div>
     </div>
@@ -1372,7 +1528,7 @@ function panelHtml() {
       <div class="sa-hint" id="sa_ledger_sum"></div>
       <div id="sa_ledger"></div>
       <div class="sa-row"><label for="sa_range_from">Only messages</label><input id="sa_range_from" class="text_pole" type="number" min="0" placeholder="from"><input id="sa_range_to" class="text_pole" type="number" min="0" placeholder="to"></div>
-      <label class="checkbox_label"><input id="sa_hide" type="checkbox"><span>Hide messages once archived</span></label>
+      <label class="checkbox_label"><input id="sa_hide" type="checkbox"><span>Legacy hiding (disabled in database mode)</span></label>
       <div class="sa-row"><label for="sa_keepvis">Keep visible</label><input id="sa_keepvis" class="text_pole" type="number" min="0" max="200" title="How many of the newest messages stay visible"></div>
       <div class="sa-row"><input id="sa_through" class="text_pole" type="number" min="0" placeholder="message #"><input id="sa_through_set" class="menu_button" type="button" value="Mark archived through"><input id="sa_ledger_import" class="menu_button" type="button" value="Import list"></div>
     </div></details>
@@ -1417,7 +1573,7 @@ function panelHtml() {
     </div></details>
 
     <details class="sa-card"><summary>📍 Delivery</summary><div class="sa-body">
-      <div class="sa-row"><label for="sa_delivery">Where the log goes</label><select id="sa_delivery" class="text_pole">
+      <div class="sa-row"><label for="sa_delivery">Legacy delivery (unused in database mode)</label><select id="sa_delivery" class="text_pole">
         <option value="depth">In the chat, at a depth</option>
         <option value="before">Before character definitions</option>
         <option value="after">After character definitions</option>
@@ -1444,12 +1600,15 @@ function panelHtml() {
     </div></details>
 
     <details class="sa-card"><summary>⚙️ More</summary><div class="sa-body">
-      <div class="sa-row"><label for="sa_archive_profile">Archive model</label><select id="sa_archive_profile" class="text_pole"></select></div>
-      <div class="sa-row"><label for="sa_side_profile">Memory and tracker model</label><select id="sa_side_profile" class="text_pole" title="Keywords, Recall, memories and Condense can use a cheaper Connection Manager profile"></select><input id="sa_side_test" class="menu_button" type="button" value="Test"></div>
+      <div class="sa-row"><label for="sa_archive_profile">Evidence scan model</label><select id="sa_archive_profile" class="text_pole"></select></div>
+      <div class="sa-row"><label for="sa_side_profile">Database extraction model</label><select id="sa_side_profile" class="text_pole" title="Keywords, structured extraction, recaps and evidence helpers can use a cheaper Connection Manager profile"></select><input id="sa_side_test" class="menu_button" type="button" value="Test"></div>
+      <div class="sa-row"><label for="sa_diary_profile">Diary model</label><select id="sa_diary_profile" class="text_pole" title="Diary writing, updating, rewriting and diary condensation use this separate Connection Manager profile"></select><input id="sa_diary_test" class="menu_button" type="button" value="Test"></div>
+      <label class="checkbox_label"><input id="sa_debug_logging" type="checkbox"><span>Write Scene Archivist debug events to the browser console</span></label>
+      <div class="sa-row"><input id="sa_debug_view" class="menu_button" type="button" value="View debug log"><input id="sa_debug_clear" class="menu_button" type="button" value="Clear debug log"></div>
       <div class="sa-row"><label for="sa_keymode">Keywords</label><select id="sa_keymode" class="text_pole"><option value="ai">Ask the model</option><option value="heuristic">Automatic only</option></select></div>
       <div class="sa-row"><label for="sa_maxtok">Max reply tokens</label><input id="sa_maxtok" class="text_pole" type="number" min="0" max="64000" title="0 uses your preset's response length"></div>
-      <div class="sa-row"><label for="sa_remind">Remind me every</label><input id="sa_remind" class="text_pole" type="number" min="0" max="500" title="Messages, 0 = never"></div>
-      <label class="checkbox_label"><input id="sa_autoarch" type="checkbox"><span>Archive automatically instead of reminding</span></label>
+      <div class="sa-row"><label for="sa_remind">Scan trigger every</label><input id="sa_remind" class="text_pole" type="number" min="0" max="500" title="Messages, 0 = never"></div>
+      <label class="checkbox_label"><input id="sa_autoarch" type="checkbox"><span>Run the batch scan automatically instead of notifying</span></label>
       <label class="checkbox_label"><input id="sa_review" type="checkbox"><span>Review before writing</span></label>
       <div class="sa-sub">Never use as keywords</div>
       <textarea id="sa_avoid" class="text_pole" rows="2" placeholder="Names in every scene, comma separated"></textarea>
@@ -1510,6 +1669,12 @@ async function openPanelPopup() {
 
 function bindUi() {
     const s = settings();
+    $('#sa_message_actions').prop('checked', s.showMessageActions === true).on('change', function () {
+        s.showMessageActions = this.checked;
+        saveSettingsDebounced();
+        chatControls?.mount();
+    });
+    $('#sa_rate_rpm').val(normalizeRPM(s.requestsPerMinute)).on('change', function () { s.requestsPerMinute = normalizeRPM(this.value); this.value = s.requestsPerMinute; saveSettingsDebounced(); });
     const bindVal = (id, key, num = false) => {
         $(id).val(s[key]).on('input change', function () { if (busy) { $(this).val(s[key]); return; } s[key] = num ? Number($(this).val()) : $(this).val(); saveSettingsDebounced(); });
     };
@@ -1528,7 +1693,8 @@ function bindUi() {
  bindVal('#sa_opening', 'opening');
     $('#sa_review').prop('checked', s.review).on('change', function () { s.review = this.checked; saveSettingsDebounced(); });
     $('#sa_lorebook').on('change', async function () { if (busy) { $(this).val(s.lorebook); return; } s.lorebook = $(this).val(); s.memoryBook = ''; await refreshChatUi(); });
-    $('#sa_create').on('click', createLorebook);
+    $('#sa_create').on('click', () => createLorebook().catch(e=>toastr.error(e.message,'Scene Archivist')));
+    $('#sa_migrate_storage').on('click', () => migrateStorage().catch(e=>toastr.error(e.message,'Scene Archivist')));
     $('#sa_run').on('click', () => runSummarize());
     $('#sa_thorough').on('click', () => runSummarize({ thorough: true }));
     const saveUnit = value => {
@@ -1551,6 +1717,8 @@ function bindUi() {
     bindVal('#sa_recall_msgs', 'recallMessages', true); bindVal('#sa_recall_max', 'recallMax', true);
     $('#sa_recall_test').on('click', testRecall);
     bindVal('#sa_remind', 'remindEvery', true);
+    $('#sa_remind').on('input change', syncCadenceControls);
+    bindCadenceControls();
     $('#sa_diag').on('click', copyDiagnostics);
     renderTrackers();
     $('#sa_tr_sel').on('change', function () { trId = String($(this).val()); renderTrackers(); });
@@ -1563,7 +1731,7 @@ function bindUi() {
     $('#sa_tr_run').on('click', () => runTrackers(trId)); $('#sa_tr_all').on('click', () => runTrackers());
     $('#sa_tr_auto').prop('checked', s.trackerAuto).on('change', function () { s.trackerAuto = this.checked; saveSettingsDebounced(); });
     bindVal('#sa_tr_days', 'trackerDays', true);
-    $('#sa_autoarch').prop('checked', s.autoArchive).on('change', function () { s.autoArchive = this.checked; saveSettingsDebounced(); });
+    $('#sa_autoarch').prop('checked', s.autoArchive).on('change', function () { s.autoArchive = this.checked; saveSettingsDebounced(); syncCadenceControls(); workbench?.layout?.refresh(); });
     $('#sa_recap').on('click', recap);
     bindVal('#sa_keepvis', 'keepVisible', true);
     $('#sa_hide').prop('checked', s.hideArchived).on('change', function () { s.hideArchived = this.checked; saveSettingsDebounced(); });
@@ -1599,44 +1767,59 @@ function bindUi() {
         toastr.info('Recap writing prompt reset to the default.');
     });
     refreshProfileList();
-    $('#sa_side_profile, #sa_archive_profile').on('change', function () { s[this.id === 'sa_archive_profile' ? 'archiveProfile' : 'sideProfile'] = this.value; saveSettingsDebounced(); workbench?.renderFlow(); });
+    $('#sa_side_profile, #sa_archive_profile, #sa_diary_profile').on('change', function () {
+        const key = this.id === 'sa_archive_profile' ? 'archiveProfile' : this.id === 'sa_diary_profile' ? 'diaryProfile' : 'sideProfile';
+        s[key] = this.value; saveSettingsDebounced(); workbench?.renderFlow(); workbench?.renderJob();
+    });
     $('#sa_side_test').on('click', testSide);
+    $('#sa_diary_test').on('click', testDiary);
+    $('#sa_debug_logging').prop('checked', !!s.debugLogging).on('change', function () { s.debugLogging = this.checked; Debug.configure(this.checked); saveSettingsDebounced(); toastr.info(this.checked ? 'Scene Archivist console debug logging enabled.' : 'Scene Archivist console debug logging disabled. Internal recent diagnostics remain available in View debug log.'); });
+    $('#sa_debug_view').on('click', async () => {
+        const root = document.createElement('div'); root.className = 'sa-review';
+        root.innerHTML = '<h3>Scene Archivist debug log</h3><p class="sa-hint">Recent diagnostic events from this page session.</p>';
+        const pre = document.createElement('pre'); pre.className = 'sa-debug-log'; pre.textContent = Debug.text() || 'No Scene Archivist diagnostic events have been recorded in this page session.'; root.append(pre);
+        const popup = new Popup(root, POPUP_TYPE.TEXT, '', { okButton: 'Close', cancelButton: false, wide: true, large: true, allowVerticalScrolling: true });
+        await popup.show();
+    });
+    $('#sa_debug_clear').on('click', () => { Debug.clear(); toastr.success('Scene Archivist debug log cleared.'); });
     $('#sa_drawer .inline-drawer-toggle').on('click', () => { refreshProfileList(); requestAnimationFrame(() => { workbench?.renderLibrary(); workbench?.layout?.help.refresh(document.querySelector('.sa-panel')); }); });
     $('#sa_mem_auto').prop('checked', s.memoryAuto).on('change', function () { s.memoryAuto = this.checked; saveSettingsDebounced(); });
     bindVal('#sa_mem_target', 'memoryTarget'); bindVal('#sa_mem_book', 'memoryBook'); bindVal('#sa_mem_from', 'memoryFrom'); bindVal('#sa_mem_to', 'memoryTo'); bindVal('#sa_mem_days', 'memoryDays', true); bindVal('#sa_mem_cap', 'memoryCap', true); bindVal('#sa_mem_prompt', 'memoryPrompt');
     $('#sa_mem_prompt_reset').on('click', () => { s.memoryPrompt = DEFAULT_SETTINGS.memoryPrompt; $('#sa_mem_prompt').val(s.memoryPrompt); saveSettingsDebounced(); toastr.info('Memory prompt reset to the default.'); });
 }
 
-jQuery(async () => {
+// The entrypoint shell registers the wand launcher and Switchboard bridge before database work.
+// Return the startup promise so the shell can report actual initialization failures.
+export async function initializeArchivist() {
     try {
         settings();
-        let dock = false;
-        try { dock = localStorage.getItem('sa_dock') === '1'; } catch { /* ignore */ }
-        if (dock) $('#extensions_settings2').append(settingsHtml());
-        else $('body').append(`<div id="sa_holder" style="display:none">${panelHtml()}</div>`);
+        try{await refreshDatabaseCatalog();}catch(error){Debug.error('DATABASE_CATALOG',error.message);toastr.error(error.message,'Scene Archivist');}
+        $('body').append(`<div id="sa_holder" style="display:none">${panelHtml()}</div>`);
         workbench = new Workbench({
             settings, meta, groupSpeaker, replyPreviewContext, currentAvatar, listChatFiles, checkSetup, profileState, bindProfile, memoryPeers, attachArchive: attachToChat,
             wasRenamed: (from, to) => Date.now() - (recentRenames.get(JSON.stringify([chatOwner(getContext()), chatName(from), chatName(to)])) || 0) < 60000,
             tokenizerKey: () => JSON.stringify([main_api, getContext().getCurrentModel?.(), power_user.tokenizer, oai_settings.chat_completion_source]),
-            openPanel: openPanelPopup, jumpToMessage: jumpToChatMessage, context: () => ({ ...getContext(), chatId: getCurrentChatId(), characterId: this_chid }),
+            openPanel: openPanelPopup, jumpToMessage: jumpToChatMessage, context: () => ({ ...getContext(), chatId: getCurrentChatId(), characterId: this_chid, getWorldInfoNames: databaseNames }),
             saveMeta: persistMeta, saveSettings: saveSettingsDebounced,
             worldNames: lorebookNames, load: readFresh, save: saveConfirmed,
-            createBook: async name => { if (!getContext().getWorldInfoNames().includes(name) && !(await createBookConfirmed(name))) throw new Error('Could not create ' + name); await updateWorldInfoList(); },
-            makeEntry: (name, data) => createWorldInfoEntry(name, data), register: registerStoryBook,
+            createBook: async name => { if (!databaseIO.has(name) && !(await createBookConfirmed(name))) throw new Error('Could not create standalone database: ' + name); },
+            requireStandalone, migrateStorage,
+            makeEntry: (name, data) => makeDatabaseEntry(name, data), register: registerStoryBook,
             memoryBook: memoryBookName, memoryBookFor, own: storyMemoryData, options: coreOpts,
-            assert: assertCurrentChat, isBusy: () => busy, isGenerating: Host.isGenerating, isActive: () => !!settings().lorebook && !!isLorebookActive(settings().lorebook),
+            assert: assertCurrentChat, isBusy: () => busy, isGenerating: Host.isGenerating, isActive: () => !!settings().lorebook,
             begin: () => { if (busy) return false; busy = true; operationChat = getContext().chat; operationRevision = chatRevision; $('.sa-run,.sa-mem-run,.sa-cond-run').prop('disabled', true); return true; },
             end: () => { pendingUndo = null; busy = false; operationChat = null; $('.sa-run,.sa-mem-run,.sa-cond-run').prop('disabled', false); },
             confirmRecovered: async (name, actual) => { if (pendingUndo) { Journal.confirmWrite(pendingUndo.journal, name, actual); await persistMeta(); } },
-            undoStart: beginUndoWrite, snapshot: saveUndoSnapshot, reload: name => { try { reloadEditor(name); } catch { /* editor closed */ } },
-            model: sideCall, flowModelInfo, sendFlowRequest, buildFlowContext, readReferences, readReferenceEntries: refs => collectReferenceEntries(refs, readFresh), readDiaryLore, tokenCount: getTokenCountAsync, hide: hideChatMessageRange, renderLedger, prepareArchive, refreshInfo: updateInfoLine,
-            archiveModel: async (req, range) => settings().archiveMode === 'chat' && !range.explicit
+            undoStart: beginUndoWrite, snapshot: saveUndoSnapshot, reload: () => {},
+            model: sideCall, flowModelInfo, sendFlowRequest, buildFlowContext, readReferences: async()=>'', readReferenceEntries: async()=>[], readDiaryLore: async()=>'', tokenCount: getTokenCountAsync, hide: hideChatMessageRange, renderLedger, prepareArchive, refreshInfo: updateInfoLine,
+            archiveModel: (req, range) => {requireStandalone();return pacedRequest(() => settings().archiveMode === 'chat' && !range.explicit
                 ? generateQuietPrompt({ quietPrompt: req.system + '\n\n' + req.prompt, responseLength: Number(settings().maxTokens) > 0 ? Number(settings().maxTokens) : null })
-                : generateRaw({ prompt: req.prompt, systemPrompt: req.system, responseLength: Number(settings().maxTokens) > 0 ? Number(settings().maxTokens) : 6000 }),
+                : generateRaw({ prompt: req.prompt, systemPrompt: req.system, responseLength: Number(settings().maxTokens) > 0 ? Number(settings().maxTokens) : 6000 }));},
+            pacingText: () => pacingText,
             acceptArchive: async (text, source, step) => { archiveSource = source; archiveStep = step; try { return await handleOutput(text); } finally { archiveSource = null; archiveStep = ''; } },
             afterArchive,
             ensureArchive: ensureLorebook,
-            attach: async name => { assignChatLorebook(name); await saveMetadata(); $('.chat_lorebook_button').addClass('world_set'); },
+            attach: async name => { assignChatLorebook(name); await saveMetadataSafe(); },
             trackers: () => runTrackers(null, true),
             confirm: async (root, opts = {}) => {
                 workbench?.layout?.help.observe(root);
@@ -1660,29 +1843,18 @@ jQuery(async () => {
             scanSupported: !!event_types.WORLDINFO_SCAN_DONE,
             scanLimit: () => world_info_max_recursion_steps,
             forceEntries: entries => eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, entries),
-            recallBook: name => worldInfoCache.get(name) ?? readFresh(name),
-            setLittleThingsPrompt: text => setExtensionPrompt('sceneArchivistLittleThings', text, extension_prompt_types.IN_CHAT, 2, false, extension_prompt_roles.SYSTEM),
+            recallBook: readFresh,
+            setLittleThingsPrompt: () => setExtensionPrompt('sceneArchivistLittleThings', '', extension_prompt_types.IN_CHAT, 2, false, extension_prompt_roles.SYSTEM),
         });
         workbench.mount(document.querySelector('.sa-panel'));
         bindUi();
         chatControls = new ChatControls(workbench);
         workbench.chatControls = chatControls;
         migrateStoryBooks();
-        await refreshChatUi();
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'archivist',
             callback: async () => { await runSummarize(); return ''; },
-            helpString: 'Run the Scene Archivist: summarize with your archivist prompt and file the result into the selected lorebook.',
-        }));
-        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-            name: 'archivist-condense',
-            callback: async () => { await runCondense(); return ''; },
-            helpString: 'Condense long character memory lists (with review).',
-        }));
-        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-            name: 'archivist-memories',
-            callback: async () => { await runMemories(); return ''; },
-            helpString: 'Create character memories using the source and range selected in Scene Archivist.',
+            helpString: 'Batch-scan uncovered story messages into the Scene Archivist evidence database. Records are retrieval-only and are never injected into the RP prompt.',
         }));
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'archivist-recap',
@@ -1690,26 +1862,13 @@ jQuery(async () => {
             helpString: 'Show a short "previously on" recap of the newest entries in the Scene Log.',
         }));
         eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
-        eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
-        for (const event of [event_types.GENERATION_ENDED, event_types.GENERATION_STOPPED].filter(Boolean)) {
-            eventSource.on(event, () => workbench.sceneRecall.finish());
-        }
         eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-        for (const event of [event_types.CHAT_COMPLETION_PROMPT_READY, event_types.GENERATE_AFTER_COMBINE_PROMPTS].filter(Boolean)) {
-            eventSource.on(event, data => workbench.extras.prompt.promptReady(data));
-        }
-        eventSource.on(event_types.WORLD_INFO_ACTIVATED, onWorldInfoActivated);
-        eventSource.on(event_types.WORLDINFO_FORCE_ACTIVATE, entries => workbench.onVectorActivated(entries));
-        if (event_types.WORLDINFO_SCAN_DONE) eventSource.on(event_types.WORLDINFO_SCAN_DONE, scan => workbench.onWorldInfoScan(scan));
-        $('#extensionsMenu').append(`<div id="sa_wand" class="list-group-item flex-container flexGap5"><div class="fa-solid fa-book-journal-whills extensionsMenuExtensionButton"></div><span>Summarize new messages</span></div>`);
-        $('#sa_wand').on('click', () => runSummarize());
-        $('#extensionsMenu').append(`<div id="sa_wand_panel" class="list-group-item flex-container flexGap5"><div class="fa-solid fa-folder-tree extensionsMenuExtensionButton"></div><span>Scene Archivist</span></div>`);
-        $('#sa_wand_panel').on('click', openPanelPopup);
         eventSource.on(event_types.CHAT_CHANGED, () => {
             chatRevision++; chatControls?.close();
             workbench.sceneRecall.reset();
             return refreshChatUi().catch(error => toastr.warning(error.message, 'Scene Archivist'));
         });
+        if (event_types.PERSONA_CHANGED) eventSource.on(event_types.PERSONA_CHANGED, () => workbench.renderDiaryReader());
         if (event_types.CHAT_RENAMED) eventSource.on(event_types.CHAT_RENAMED, onChatRenamed);
         if (event_types.CHARACTER_RENAMED) eventSource.on(event_types.CHARACTER_RENAMED, (previous, next) => {
             const s = settings();
@@ -1731,7 +1890,13 @@ jQuery(async () => {
                 if (!busy) { workbench.renderFlow(); workbench.extras.render(); }
             }, 180);
         });
+        // A failed initial refresh must not erase an otherwise mounted workspace.
+        try { await refreshChatUi(); }
+        catch (error) { Debug.error('INITIAL_REFRESH_FAILED', 'Initial chat refresh failed.', error); console.error('[Scene Archivist][INITIAL_REFRESH_FAILED]', error); return { refreshError: error?.message || String(error) }; }
+        return {};
     } catch (e) {
-        console.error(LOG, 'failed to load', e);
+        Debug.error('STARTUP_FAILED', 'Scene Archivist failed during startup.', e); console.error('[Scene Archivist][STARTUP_FAILED]', e);
+        throw e;
     }
-});
+}
+export { openPanelPopup };

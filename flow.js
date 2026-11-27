@@ -7,7 +7,7 @@ export function messageRuns(messages) {
 }
 
 export function selectedMessages(chat, range) {
-    return range ? M.messageRange(chat, range.from, range.to).messages : [];
+    return range ? M.messageRange(chat, range.from, range.to).messages.filter(message => M.storyMessage(chat[message.idx])) : [];
 }
 
 export function uncoveredMemoryMessages(chat, receipts = [], persona = false) {
